@@ -39,11 +39,15 @@ def ema(series: pd.Series, period: int) -> pd.Series:
 
 def slope_pct(series: pd.Series, lookback: int) -> pd.Series:
     ref = series.shift(lookback)
-    return (series.sub(ref)).div(ref).mul(100.0)
+    return (series.sub(ref)).div(ref.replace(0, np.nan)).mul(100.0)
 
 def calc_size(equity: float, price: float, risk_fraction: float, max_leverage: float) -> float:
     notional = equity * risk_fraction * max(1.0, min(max_leverage, 100.0))
     return 0.0 if price <= 0 else notional / price
+
+def apply_slip(price: float, is_buy: bool, slippage_percent: float) -> float:
+    s = slippage_percent / 100.0
+    return price * (1 + s) if is_buy else price * (1 - s)
 
 # -----------------------------
 # Sidebar — Global Inputs
@@ -101,7 +105,6 @@ def generate_signals(data: pd.DataFrame) -> pd.DataFrame:
     out['SlopePct'] = slope_pct(out['EMA'], int(slope_lookback)).fillna(0.0)
     out['trend_up'] = out['SlopePct'] > float(min_slope_percent)
     out['trend_dn'] = out['SlopePct'] < -float(min_slope_percent)
-    # Cross conditions use prev close vs prev EMA, and current close vs current EMA
     out['prev_close'] = out['Close'].shift(1)
     out['prev_ema'] = out['EMA'].shift(1)
     out['bull_cross'] = (out['prev_close'] < out['prev_ema']) & (out['Close'] > out['EMA'])
@@ -110,82 +113,100 @@ def generate_signals(data: pd.DataFrame) -> pd.DataFrame:
 
 df_sig = generate_signals(df)
 
-def apply_slip(price: float, is_buy: bool) -> float:
-    s = slippage_percent / 100.0
-    return price * (1 + s) if is_buy else price * (1 - s)
-
-def fill_fee(notional: float) -> float:
-    return notional * (fee_percent / 100.0)
-
 # -----------------------------
 # Backtest mode
 # -----------------------------
 if mode == "Backtest":
     st.subheader("Backtest")
     initial_cash = st.number_input("Initial cash", 100.0, 1_000_000.0, 10_000.0, step=100.0)
+    show_trades_on_chart = st.checkbox("Show trades on chart", value=True)
     run_bt = st.button("Run Backtest")
 
     class Strat(Strategy):
         def init(self):
             pass
         def next(self):
-            i = len(self.data) - 1
-            close = self.data.Close[-1]
-            # derive EMA & signals from df_sig by index alignment
             ts = self.data.index[-1]
+            close = self.data.Close[-1]
             row = df_sig.loc[ts]
             if pd.isna(row['prev_close']) or pd.isna(row['prev_ema']):
                 return
 
-            # trailing: backtesting.py supports sl via order args; we'll maintain via set_sl on Position
+            # Trailing stop update
             if self.position:
+                # use stored entry ts if present, else last index
+                start_ts = getattr(self, 'last_entry_ts', self.data.index[-1])
                 if self.position.is_long:
-                    recent_high = df.loc[getattr(self, 'last_entry_ts', df.index[-1]): ts]['High'].max()
-                    new_sl = recent_high * (1 - trail_percent/100.0)
+                    recent_high = df.loc[start_ts: ts]['High'].max()
+                    new_sl = recent_high * (1 - float(trail_percent)/100.0)
                     if self.position.sl is None or new_sl > self.position.sl:
                         self.position.set_sl(new_sl)
                 else:
-                    recent_low = df.loc[getattr(self, 'last_entry_ts', df.index[-1]): ts]['Low'].min()
-                    new_sl = recent_low * (1 + trail_percent/100.0)
+                    recent_low = df.loc[start_ts: ts]['Low'].min()
+                    new_sl = recent_low * (1 + float(trail_percent)/100.0)
                     if self.position.sl is None or new_sl < self.position.sl:
                         self.position.set_sl(new_sl)
 
+            # Entries
             if not self.position:
                 size = calc_size(self.equity, close, float(risk_fraction), float(max_leverage))
                 if size <= 0:
                     return
                 if row['bull_cross'] and row['trend_up']:
-                    entry = apply_slip(close, True)
-                    fee = fill_fee(entry * size)
+                    entry = apply_slip(close, True, float(slippage_percent))
                     sl = entry * (1 - float(stop_loss_percent)/100.0) if stop_loss_percent>0 else None
                     self.last_entry_ts = ts
                     self.buy(size=size, sl=sl)
-                elif allow_shorts and row['bear_cross'] and row['trend_dn']:
-                    entry = apply_slip(close, False)
-                    fee = fill_fee(entry * size)
+                elif bool(allow_shorts) and row['bear_cross'] and row['trend_dn']:
+                    entry = apply_slip(close, False, float(slippage_percent))
                     sl = entry * (1 + float(stop_loss_percent)/100.0) if stop_loss_percent>0 else None
                     self.last_entry_ts = ts
                     self.sell(size=size, sl=sl)
 
     if run_bt:
         bt = Backtest(df[['Open','High','Low','Close','Volume']], Strat,
-                      cash=float(initial_cash), commission=(float(fee_percent)+float(slippage_percent))/100.0, exclusive_orders=False)
+                      cash=float(initial_cash),
+                      commission=(float(fee_percent)+float(slippage_percent))/100.0,
+                      exclusive_orders=False)
         stats = bt.run()
         st.write(stats.to_frame().style.format(precision=5))
-        html = bt.plot(open_browser=False)
-        st.components.v1.html(html, height=900, scrolling=True)
+
+        # --- Plotly chart (avoid Bokeh) ---
+        ema_series = ema(df['Close'], int(ema_period))
+        fig = go.Figure(data=[
+            go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="Price")
+        ])
+        fig.add_trace(go.Scatter(x=df.index, y=ema_series, name=f"EMA({int(ema_period)})"))
+
+        if show_trades_on_chart and hasattr(stats, "_trades") and isinstance(stats._trades, pd.DataFrame):
+            tdf = stats._trades.copy()
+            # Mark entries
+            if "EntryTime" in tdf.columns:
+                fig.add_trace(go.Scatter(
+                    x=tdf["EntryTime"], y=tdf["EntryPrice"],
+                    mode="markers", name="Entries",
+                    marker=dict(size=9, symbol="triangle-up")
+                ))
+            # Mark exits
+            if "ExitTime" in tdf.columns:
+                fig.add_trace(go.Scatter(
+                    x=tdf["ExitTime"], y=tdf["ExitPrice"],
+                    mode="markers", name="Exits",
+                    marker=dict(size=9, symbol="x")
+                ))
+        fig.update_layout(height=800, xaxis_title="Time", yaxis_title=symbol)
+        st.plotly_chart(fig, use_container_width=True)
 
 # -----------------------------
 # Dry-Run (paper) mode
 # -----------------------------
 else:
     st.subheader("Dry-Run (Paper Trading)")
-    # Session state for portfolio
     if "paper_state" not in st.session_state:
         st.session_state.paper_state = {
             "equity": 10_000.0,
-            "position": None,     # dict with {side, size, entry, sl, entry_time}
-            "trades": [],         # list of dicts
+            "position": None,
+            "trades": [],
         }
 
     equity = st.number_input("Paper initial equity", 100.0, 1_000_000.0, float(st.session_state.paper_state["equity"]), step=100.0)
@@ -193,20 +214,6 @@ else:
     if apply_equity:
         st.session_state.paper_state["equity"] = equity
 
-    def render_position(pos):
-        if not pos:
-            st.info("No open position.")
-            return
-        st.write(f"**Side**: {pos['side']}  |  **Size**: {pos['size']:.6f}  |  **Entry**: {pos['entry']:.2f}  |  **SL**: {pos.get('sl')}  |  **Since**: {pos['entry_time']}")
-
-    # Controls
-    step_btn = st.button("Step 1 bar (latest)")
-    auto = st.checkbox("Auto-refresh every N seconds")
-    interval = st.number_input("Refresh seconds", 2, 120, 10)
-    if auto:
-        st.caption("Streamlit will refresh after the interval via the browser's rerun.")
-
-    # One step evaluation
     def process_bar(ts: pd.Timestamp):
         row = df_sig.loc[ts]
         close = df.loc[ts]['Close']
@@ -214,7 +221,7 @@ else:
         low  = df.loc[ts]['Low']
         state = st.session_state.paper_state
 
-        # Update trailing on open position
+        # Update trailing
         if state["position"]:
             pos = state["position"]
             if pos["side"] == "long":
@@ -222,11 +229,10 @@ else:
                 new_sl = recent_high * (1 - float(trail_percent)/100.0)
                 if pos.get("sl") is None or new_sl > pos["sl"]:
                     pos["sl"] = new_sl
-                # Stop-out check
                 if low <= pos["sl"]:
                     exit_px = pos["sl"]
                     notional = exit_px * pos["size"]
-                    fee = fill_fee(notional)
+                    fee = notional * (float(fee_percent)/100.0)
                     pnl = (exit_px - pos["entry"]) * pos["size"] - fee
                     state["equity"] += pnl
                     state["trades"].append({"time": ts, "side": "sell", "price": exit_px, "size": pos["size"], "pnl": pnl, "reason": "trail/SL"})
@@ -239,7 +245,7 @@ else:
                 if high >= pos["sl"]:
                     exit_px = pos["sl"]
                     notional = exit_px * pos["size"]
-                    fee = fill_fee(notional)
+                    fee = notional * (float(fee_percent)/100.0)
                     pnl = (pos["entry"] - exit_px) * pos["size"] - fee
                     state["equity"] += pnl
                     state["trades"].append({"time": ts, "side": "buy", "price": exit_px, "size": pos["size"], "pnl": pnl, "reason": "trail/SL"})
@@ -250,57 +256,59 @@ else:
             size = calc_size(state["equity"], close, float(risk_fraction), float(max_leverage))
             if size > 0:
                 if row["bull_cross"] and row["trend_up"]:
-                    px = apply_slip(close, True)
+                    px = apply_slip(close, True, float(slippage_percent))
                     notional = px * size
-                    fee = fill_fee(notional)
+                    fee = notional * (float(fee_percent)/100.0)
                     state["equity"] -= fee
                     sl = px * (1 - float(stop_loss_percent)/100.0) if float(stop_loss_percent)>0 else None
                     state["position"] = {"side":"long","size":size,"entry":px,"sl":sl,"entry_time":ts}
                     state["trades"].append({"time": ts, "side": "buy", "price": px, "size": size, "pnl": 0.0, "reason": "entry"})
                 elif bool(allow_shorts) and row["bear_cross"] and row["trend_dn"]:
-                    px = apply_slip(close, False)
+                    px = apply_slip(close, False, float(slippage_percent))
                     notional = px * size
-                    fee = fill_fee(notional)
+                    fee = notional * (float(fee_percent)/100.0)
                     state["equity"] -= fee
                     sl = px * (1 + float(stop_loss_percent)/100.0) if float(stop_loss_percent)>0 else None
                     state["position"] = {"side":"short","size":size,"entry":px,"sl":sl,"entry_time":ts}
                     state["trades"].append({"time": ts, "side": "sell", "price": px, "size": size, "pnl": 0.0, "reason": "entry"})
 
-        # Hard stop-loss if still in position and SL breached intrabar
+        # Hard SL intrabar
         if st.session_state.paper_state["position"]:
             pos = st.session_state.paper_state["position"]
             if pos["side"] == "long" and low <= pos["sl"]:
                 exit_px = pos["sl"]
-                fee = fill_fee(exit_px * pos["size"])
+                fee = exit_px * pos["size"] * (float(fee_percent)/100.0)
                 pnl = (exit_px - pos["entry"]) * pos["size"] - fee
                 st.session_state.paper_state["equity"] += pnl
                 st.session_state.paper_state["trades"].append({"time": ts, "side": "sell", "price": exit_px, "size": pos["size"], "pnl": pnl, "reason": "SL"})
                 st.session_state.paper_state["position"] = None
             elif pos["side"] == "short" and high >= pos["sl"]:
                 exit_px = pos["sl"]
-                fee = fill_fee(exit_px * pos["size"])
+                fee = exit_px * pos["size"] * (float(fee_percent)/100.0)
                 pnl = (pos["entry"] - exit_px) * pos["size"] - fee
                 st.session_state.paper_state["equity"] += pnl
                 st.session_state.paper_state["trades"].append({"time": ts, "side": "buy", "price": exit_px, "size": pos["size"], "pnl": pnl, "reason": "SL"})
                 st.session_state.paper_state["position"] = None
 
-    # Run one step or auto
+    col1, col2 = st.columns([1,1])
+    with col1:
+        step_btn = st.button("Step 1 latest bar")
+    with col2:
+        reset_btn = st.button("Reset paper state")
+
+    if reset_btn:
+        st.session_state.paper_state = {"equity": float(equity), "position": None, "trades": []}
+
     if step_btn:
         ts = df_sig.index[-1]
         process_bar(ts)
 
-    if auto:
-        ts = df_sig.index[-1]
-        process_bar(ts)
-        time.sleep(int(interval))
-        st.experimental_rerun()
-
-    # Render portfolio state
     st.markdown("### Portfolio")
     st.write(f"**Equity:** {st.session_state.paper_state['equity']:.2f}")
-    render_position(st.session_state.paper_state["position"])
+    pos = st.session_state.paper_state["position"]
+    if pos:
+        st.write(f"**Position:** {pos['side']} | size {pos['size']:.6f} | entry {pos['entry']:.2f} | SL {pos.get('sl')}")
 
-    # Trades table
     if st.session_state.paper_state["trades"]:
         trades_df = pd.DataFrame(st.session_state.paper_state["trades"])
         st.markdown("### Trades")
@@ -310,4 +318,4 @@ else:
     else:
         st.info("No trades yet.")
 
-st.caption("Built for Sani • Backtest & Dry-Run with configurable fees, slippage, leverage cap, and UI controls.")
+st.caption("Built for Sani • Backtest & Dry-Run with Plotly chart (Bokeh removed).")
