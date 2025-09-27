@@ -4,4 +4,5 @@ pandas>=2.0
 numpy>=1.24
 ccxt>=4.3.80
 backtesting==0.3.3
+backtrader>=1.9.78.123
 plotly>=5.22

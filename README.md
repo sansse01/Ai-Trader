@@ -1,11 +1,13 @@
 
-# EMA9 Trend Trader – Web App (Streamlit) v3.4
+# EMA9 Trend Trader — v3.6 (Trade Analysis)
 
-- Backtest trailing stop implemented **without** Position.set_sl / Position.sl
-- Initial SL still set via order param; trailing exits close position when breach is detected
-- Plotly chart, paging fix, equity-fraction sizing, commission=fee+slippage, diagnostics, paper mode
+Adds a **Trade Analysis** section for both backtest engines:
+- **Simple (backtesting.py)**: uses `stats._trades`, augments with Direction, Duration, ReturnPct_est, CSV export.
+- **TRUE STOP (backtrader)**: uses a custom Analyzer (`TradeLogger`) to build a trades table with Direction, Entry/Exit, Size, PnL, Duration, ReturnPct_est.
 
-## Run
+Other features stay: Plotly charting, Kraken paging, fee+slippage, signal diagnostics, leverage cap.
+
+Run:
 ```bash
 python -m venv .venv
 # Windows: .venv\Scripts\activate
