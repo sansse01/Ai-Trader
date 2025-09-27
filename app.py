@@ -140,12 +140,12 @@ if mode == "Backtest":
             # trailing: backtesting.py supports sl via order args; we'll maintain via set_sl on Position
             if self.position:
                 if self.position.is_long:
-                    recent_high = df.loc[self.position.entry_time: ts]['High'].max()
+                    recent_high = df.loc[getattr(self, 'last_entry_ts', df.index[-1]): ts]['High'].max()
                     new_sl = recent_high * (1 - trail_percent/100.0)
                     if self.position.sl is None or new_sl > self.position.sl:
                         self.position.set_sl(new_sl)
                 else:
-                    recent_low = df.loc[self.position.entry_time: ts]['Low'].min()
+                    recent_low = df.loc[getattr(self, 'last_entry_ts', df.index[-1]): ts]['Low'].min()
                     new_sl = recent_low * (1 + trail_percent/100.0)
                     if self.position.sl is None or new_sl < self.position.sl:
                         self.position.set_sl(new_sl)
@@ -157,19 +157,19 @@ if mode == "Backtest":
                 if row['bull_cross'] and row['trend_up']:
                     entry = apply_slip(close, True)
                     fee = fill_fee(entry * size)
-                    self.equity -= fee
                     sl = entry * (1 - float(stop_loss_percent)/100.0) if stop_loss_percent>0 else None
+                    self.last_entry_ts = ts
                     self.buy(size=size, sl=sl)
                 elif allow_shorts and row['bear_cross'] and row['trend_dn']:
                     entry = apply_slip(close, False)
                     fee = fill_fee(entry * size)
-                    self.equity -= fee
                     sl = entry * (1 + float(stop_loss_percent)/100.0) if stop_loss_percent>0 else None
+                    self.last_entry_ts = ts
                     self.sell(size=size, sl=sl)
 
     if run_bt:
         bt = Backtest(df[['Open','High','Low','Close','Volume']], Strat,
-                      cash=float(initial_cash), commission=0.0, exclusive_orders=False)
+                      cash=float(initial_cash), commission=(float(fee_percent)+float(slippage_percent))/100.0, exclusive_orders=False)
         stats = bt.run()
         st.write(stats.to_frame().style.format(precision=5))
         html = bt.plot(open_browser=False)
