@@ -1,0 +1,7 @@
+
+streamlit>=1.36
+pandas>=2.0
+numpy>=1.24
+ccxt>=4.3.80
+backtesting==0.3.3
+plotly>=5.22
