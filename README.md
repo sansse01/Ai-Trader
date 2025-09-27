@@ -1,8 +1,9 @@
 
-# EMA9 Trend Trader – Web App (Streamlit) v2 (Bokeh-free)
+# EMA9 Trend Trader – Web App (Streamlit) v3.4
 
-This build removes the Bokeh dependency from backtesting.py's plot and uses Plotly for charting,
-fixing the `DatetimeTickFormatter ... expected str got list` error.
+- Backtest trailing stop implemented **without** Position.set_sl / Position.sl
+- Initial SL still set via order param; trailing exits close position when breach is detected
+- Plotly chart, paging fix, equity-fraction sizing, commission=fee+slippage, diagnostics, paper mode
 
 ## Run
 ```bash

@@ -5,4 +5,3 @@ numpy>=1.24
 ccxt>=4.3.80
 backtesting==0.3.3
 plotly>=5.22
-# no bokeh required
