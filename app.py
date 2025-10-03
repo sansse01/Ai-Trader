@@ -1,11 +1,11 @@
 
-import itertools
 import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 import ccxt
 import time
+from ai_optimizer import run_ai_optimizer, _to_native
 
 st.set_page_config(page_title="EMA9 Trend Trader — Contract Size (Option 2)", layout="wide")
 st.title("📈 EMA9 Trend Trader — Kraken (Contract Size)")
@@ -90,16 +90,6 @@ def plot_chart(df, ema_period, trades=None, symbol=""):
                                      marker=dict(size=9, symbol="x")))
     fig.update_layout(height=800, xaxis_title="Time", yaxis_title=symbol)
     return fig
-
-
-def _to_native(value):
-    if isinstance(value, (np.generic,)):
-        return value.item()
-    if isinstance(value, (pd.Timestamp, pd.Timedelta)):
-        return value
-    return value
-
-
 def run_simple_backtest(df: pd.DataFrame, params: dict, df_sig: pd.DataFrame | None = None):
     from backtesting import Backtest, Strategy
 
@@ -450,6 +440,7 @@ def generate_range(range_spec: dict) -> list:
         filtered.append(round(stop, 10))
     return filtered
 
+
 # -----------------------------
 # Sidebar
 # -----------------------------
@@ -615,40 +606,43 @@ if mode == "Backtest":
                 st.warning("No parameter ranges provided. Add min/max/step values to at least one parameter.")
             else:
                 limit = min(total_combinations, int(max_evaluations))
-                combos_iter = itertools.product(*range_values.values())
                 combos_keys = list(range_values.keys())
                 status = st.status("Running optimization...", state="running")
                 progress = st.progress(0)
-                results_rows = []
-                evaluated = 0
 
-                for combo in combos_iter:
-                    evaluated += 1
-                    combo_params = base_params.copy()
-                    for k, v in zip(combos_keys, combo):
-                        combo_params[k] = v
+                def evaluate_combo(params: dict):
                     if engine == "Simple (backtesting.py)":
-                        result = run_simple_backtest(df, combo_params)
+                        return run_simple_backtest(df, params)
+                    return run_true_stop_backtest(df, params)
+
+                def progress_callback(done, total, params, metrics, objective_raw):
+                    fraction = done / total if total else 1.0
+                    progress.progress(min(1.0, fraction))
+                    if objective_raw is None or pd.isna(objective_raw):
+                        objective_display = "N/A"
                     else:
-                        result = run_true_stop_backtest(df, combo_params)
+                        try:
+                            objective_display = round(float(objective_raw), 4)
+                        except Exception:
+                            objective_display = objective_raw
+                    status.write(
+                        f"Evaluated {done} / {total} combinations — Objective: {objective_display}"
+                    )
 
-                    metrics = result.get("metrics", {})
-                    objective_value = metrics.get(objective_metric)
-                    if objective_value is None:
-                        objective_value = float("-inf") if maximize_objective else float("inf")
-                    row = {k: combo_params[k] for k in combos_keys}
-                    row.update(metrics)
-                    row["Objective"] = objective_value
-                    results_rows.append(row)
-
-                    progress.progress(min(1.0, evaluated / limit))
-                    status.write(f"Evaluated {evaluated} / {limit} combinations")
-
-                    if evaluated >= limit:
-                        break
+                opt_result = run_ai_optimizer(
+                    base_params=base_params,
+                    range_values=range_values,
+                    evaluate_fn=evaluate_combo,
+                    objective_metric=objective_metric,
+                    maximize=maximize_objective,
+                    max_evaluations=limit,
+                    progress_callback=progress_callback,
+                )
 
                 status.update(label="Optimization complete", state="complete")
+                progress.progress(1.0 if opt_result.get("evaluations", 0) else 0.0)
 
+                results_rows = opt_result.get("results", [])
                 if results_rows:
                     results_df = pd.DataFrame(results_rows)
                     ascending = not maximize_objective
@@ -656,23 +650,21 @@ if mode == "Backtest":
                     st.markdown("### Optimization results")
                     st.dataframe(results_df)
 
-                    best_row = results_df.iloc[0]
-                    best_params = base_params.copy()
-                    for k in combos_keys:
-                        best_params[k] = best_row[k]
+                    best_params = opt_result.get("best_params")
+                    best_row = opt_result.get("best_row")
+                    if best_params and best_row:
+                        st.session_state["best_run"] = {
+                            "params": best_params,
+                            "metrics": {k: best_row[k] for k in best_row if k not in combos_keys},
+                        }
 
-                    st.session_state["best_run"] = {
-                        "params": best_params,
-                        "metrics": {col: best_row[col] for col in results_df.columns if col not in combos_keys},
-                    }
-
-                    if st.button("Apply top parameters to controls", key="apply_best"):
-                        for k, v in best_params.items():
-                            if k in PARAM_CONFIG:
-                                st.session_state[k] = v
-                            elif k in {"allow_shorts", "ignore_trend", "sizing_mode"}:
-                                st.session_state[k] = v
-                        st.experimental_rerun()
+                        if st.button("Apply top parameters to controls", key="apply_best"):
+                            for k, v in best_params.items():
+                                if k in PARAM_CONFIG:
+                                    st.session_state[k] = v
+                                elif k in {"allow_shorts", "ignore_trend", "sizing_mode"}:
+                                    st.session_state[k] = v
+                            st.experimental_rerun()
                 else:
                     st.warning("No results produced during optimization.")
 
