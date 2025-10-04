@@ -1,14 +1,19 @@
 
 import itertools
+import time
+from typing import Dict, Iterable, Tuple
+
+import ccxt
 import numpy as np
 import pandas as pd
-import streamlit as st
 import plotly.graph_objects as go
-import ccxt
-import time
+import streamlit as st
 
-st.set_page_config(page_title="EMA9 Trend Trader — Contract Size (Option 2)", layout="wide")
-st.title("📈 EMA9 Trend Trader — Kraken (Contract Size)")
+from strategies import DEFAULT_STRATEGY_KEY, STRATEGY_REGISTRY
+from strategies.base import StrategyDefinition
+
+st.set_page_config(page_title="AI Trader — Contract Size", layout="wide")
+st.title("📈 AI Trader — Kraken (Contract Size)")
 
 # -----------------------------
 # Kraken symbol normalization (BTC↔XBT) + robust fetch
@@ -56,38 +61,54 @@ def fetch_ohlcv(symbol: str, timeframe: str, since_ms: int, limit_per_page: int 
     df = df.drop_duplicates(subset=['Timestamp']).set_index('Timestamp').sort_index()
     return df
 
-def ema(series: pd.Series, period: int) -> pd.Series:
-    return series.ewm(span=period, adjust=False).mean()
+def plot_chart(
+    df: pd.DataFrame,
+    overlays: Iterable[Tuple[str, pd.Series]] | None = None,
+    trades: list | None = None,
+    symbol: str = "",
+):
+    fig = go.Figure(
+        [
+            go.Candlestick(
+                x=df.index,
+                open=df['Open'],
+                high=df['High'],
+                low=df['Low'],
+                close=df['Close'],
+                name="Price",
+            )
+        ]
+    )
 
-def slope_pct(series: pd.Series, lookback: int) -> pd.Series:
-    ref = series.shift(lookback)
-    return (series.sub(ref)).div(ref).mul(100.0)
-
-def signals(df: pd.DataFrame, ema_period: int, lb: int, min_slope: float) -> pd.DataFrame:
-    s = df.copy()
-    s['EMA'] = ema(s['Close'], ema_period)
-    s['SlopePct'] = slope_pct(s['EMA'], lb).fillna(0.0)
-    s['trend_up'] = s['SlopePct'] > min_slope
-    s['trend_dn'] = s['SlopePct'] < -min_slope
-    s['prev_close'] = s['Close'].shift(1)
-    s['prev_ema'] = s['EMA'].shift(1)
-    s['bull_cross'] = (s['prev_close'] <= s['prev_ema']) & (s['Close'] > s['EMA'])
-    s['bear_cross'] = (s['prev_close'] >= s['prev_ema']) & (s['Close'] < s['EMA'])
-    return s
-
-def plot_chart(df, ema_period, trades=None, symbol=""):
-    ema_line = ema(df['Close'], int(ema_period))
-    fig = go.Figure([go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="Price")])
-    fig.add_trace(go.Scatter(x=df.index, y=ema_line, name=f"EMA({int(ema_period)})"))
+    if overlays:
+        for label, series in overlays:
+            if series is None:
+                continue
+            aligned = series.reindex(df.index)
+            fig.add_trace(go.Scatter(x=df.index, y=aligned, name=label))
     if trades is not None and len(trades):
-        ent = [t for t in trades if t.get('etype')=='entry']
-        exi = [t for t in trades if t.get('etype')=='exit']
+        ent = [t for t in trades if t.get('etype') == 'entry']
+        exi = [t for t in trades if t.get('etype') == 'exit']
         if ent:
-            fig.add_trace(go.Scatter(x=[t['time'] for t in ent], y=[t['price'] for t in ent], mode="markers", name="Entries",
-                                     marker=dict(size=9, symbol="triangle-up")))
+            fig.add_trace(
+                go.Scatter(
+                    x=[t['time'] for t in ent],
+                    y=[t['price'] for t in ent],
+                    mode="markers",
+                    name="Entries",
+                    marker=dict(size=9, symbol="triangle-up"),
+                )
+            )
         if exi:
-            fig.add_trace(go.Scatter(x=[t['time'] for t in exi], y=[t['price'] for t in exi], mode="markers", name="Exits",
-                                     marker=dict(size=9, symbol="x")))
+            fig.add_trace(
+                go.Scatter(
+                    x=[t['time'] for t in exi],
+                    y=[t['price'] for t in exi],
+                    mode="markers",
+                    name="Exits",
+                    marker=dict(size=9, symbol="x"),
+                )
+            )
     fig.update_layout(height=800, xaxis_title="Time", yaxis_title=symbol)
     return fig
 
@@ -100,7 +121,62 @@ def _to_native(value):
     return value
 
 
-def run_simple_backtest(df: pd.DataFrame, params: dict, df_sig: pd.DataFrame | None = None):
+def _format_label(template: str, params: Dict[str, object]) -> str:
+    try:
+        return template.format(**params)
+    except Exception:
+        return template
+
+
+def _build_chart_overlays(
+    strategy: StrategyDefinition,
+    df_sig: pd.DataFrame,
+    params: Dict[str, object],
+) -> list[Tuple[str, pd.Series]]:
+    overlays: list[Tuple[str, pd.Series]] = []
+    specs = strategy.data_requirements.get("chart_overlays", []) if strategy else []
+    for spec in specs:
+        column = spec.get("column")
+        if not column or column not in df_sig:
+            continue
+        label_template = spec.get("label", column)
+        label = _format_label(label_template, params)
+        overlays.append((label, df_sig[column]))
+    return overlays
+
+
+def _compute_signal_summary(
+    strategy: StrategyDefinition,
+    df_sig: pd.DataFrame,
+    ignore_trend: bool,
+) -> Dict[str, int]:
+    summary: Dict[str, int] = {"bars": int(len(df_sig))}
+    signal_cols = strategy.data_requirements.get("signal_columns", {}) if strategy else {}
+
+    long_key = signal_cols.get("long")
+    short_key = signal_cols.get("short")
+    trend_up_key = signal_cols.get("trend_up")
+    trend_down_key = signal_cols.get("trend_down")
+
+    if long_key and long_key in df_sig:
+        long_mask = df_sig[long_key].astype(bool)
+        if not ignore_trend and trend_up_key and trend_up_key in df_sig:
+            long_mask = long_mask & df_sig[trend_up_key].astype(bool)
+        summary["long_cond_count"] = int(long_mask.sum())
+    if short_key and short_key in df_sig:
+        short_mask = df_sig[short_key].astype(bool)
+        if not ignore_trend and trend_down_key and trend_down_key in df_sig:
+            short_mask = short_mask & df_sig[trend_down_key].astype(bool)
+        summary["short_cond_count"] = int(short_mask.sum())
+    return summary
+
+
+def run_simple_backtest(
+    df: pd.DataFrame,
+    params: dict,
+    strategy: StrategyDefinition | None = None,
+    df_sig: pd.DataFrame | None = None,
+):
     from backtesting import Backtest, Strategy
 
     ema_period = int(params.get('ema_period', 9))
@@ -118,7 +194,9 @@ def run_simple_backtest(df: pd.DataFrame, params: dict, df_sig: pd.DataFrame | N
     slippage_percent = float(params.get('slippage_percent', 0.0))
 
     if df_sig is None:
-        df_sig = signals(df, ema_period, slope_lookback, min_slope_percent)
+        if strategy is None:
+            raise ValueError("Strategy definition required when signals are not provided.")
+        df_sig = strategy.generate_signals(df, params)
 
     df_bt = df[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
     df_bt[['Open', 'High', 'Low', 'Close']] = df_bt[['Open', 'High', 'Low', 'Close']] * contract_size
@@ -453,19 +531,6 @@ def generate_range(range_spec: dict) -> list:
 # -----------------------------
 # Sidebar
 # -----------------------------
-PARAM_CONFIG = {
-    "ema_period": dict(label="EMA period", dtype=int, min=1, max=200, value=9, step=1),
-    "slope_lookback": dict(label="Slope lookback (bars)", dtype=int, min=1, max=200, value=5, step=1),
-    "min_slope_percent": dict(label="Min slope %", dtype=float, min=0.0, max=100.0, value=0.1, step=0.1, format="%.2f"),
-    "stop_loss_percent": dict(label="Stop loss %", dtype=float, min=0.0, max=50.0, value=2.0, step=0.1, format="%.2f"),
-    "trail_percent": dict(label="Trailing stop %", dtype=float, min=0.0, max=50.0, value=1.5, step=0.1, format="%.2f"),
-    "fee_percent": dict(label="Fee % per fill", dtype=float, min=0.0, max=2.0, value=0.26, step=0.01, format="%.4f"),
-    "slippage_percent": dict(label="Slippage % per fill", dtype=float, min=0.0, max=2.0, value=0.05, step=0.01, format="%.4f"),
-    "max_leverage": dict(label="Max leverage", dtype=float, min=1.0, max=10.0, value=5.0, step=0.5, format="%.2f"),
-    "risk_fraction": dict(label="Risk fraction of equity", dtype=float, min=0.01, max=1.0, value=0.25, step=0.01, slider=True),
-    "contract_size": dict(label="Contract size (BTC per unit)", dtype=float, min=0.000001, max=10.0, value=0.001, step=0.0001, format="%.6f"),
-}
-
 with st.sidebar:
     st.header("Mode & Engine")
     run_mode = st.radio("Run mode", ["Single Run", "Optimization"], index=0, key="run_mode")
@@ -484,9 +549,26 @@ with st.sidebar:
         st.error("Invalid 'Since' string (e.g. 2023-01-01T00:00:00Z)")
 
     st.header("Strategy")
+    strategy_keys = list(STRATEGY_REGISTRY.keys())
+    default_strategy = st.session_state.get("active_strategy", DEFAULT_STRATEGY_KEY)
+    if default_strategy not in STRATEGY_REGISTRY:
+        default_strategy = DEFAULT_STRATEGY_KEY
+    strategy_index = strategy_keys.index(default_strategy)
+    selected_strategy_key = st.selectbox(
+        "Strategy",
+        strategy_keys,
+        index=strategy_index,
+        format_func=lambda key: STRATEGY_REGISTRY[key].name,
+        key="active_strategy",
+    )
+    active_strategy = STRATEGY_REGISTRY[selected_strategy_key]
+    if active_strategy.description:
+        st.caption(active_strategy.description)
+
+    st.header("Strategy Parameters")
     scalar_params = {}
     range_specs = {}
-    for key, cfg in PARAM_CONFIG.items():
+    for key, cfg in active_strategy.controls.items():
         default_value = st.session_state.get(key, cfg.get("value"))
         value, range_spec = render_scalar_or_range(
             cfg["label"],
@@ -539,16 +621,30 @@ st.download_button("Download OHLCV CSV", data=csv, file_name=f"{symbol.replace('
 # -----------------------------
 # Signals
 # -----------------------------
-ema_period_val = int(scalar_params["ema_period"])
-slope_lookback_val = int(scalar_params["slope_lookback"])
-min_slope_val = float(scalar_params["min_slope_percent"])
+strategy_params = {
+    **scalar_params,
+    "allow_shorts": allow_shorts,
+    "ignore_trend": ignore_trend,
+    "sizing_mode": sizing_mode,
+    "timeframe": timeframe,
+}
 
-df_sig = signals(df, ema_period_val, slope_lookback_val, min_slope_val)
+prepared_df = active_strategy.prepare_data(df, strategy_params)
+df_sig = active_strategy.generate_signals(prepared_df, strategy_params)
+chart_overlays = _build_chart_overlays(active_strategy, df_sig, strategy_params)
 
 with st.expander("🔎 Signal diagnostics"):
-    longc = int((df_sig['bull_cross'] & (df_sig['trend_up'] | ignore_trend)).sum())
-    shortc = int((df_sig['bear_cross'] & (df_sig['trend_dn'] | ignore_trend)).sum())
-    st.write({"bars": int(len(df)), "long_cond_count": longc, "short_cond_count": shortc})
+    summary = _compute_signal_summary(active_strategy, df_sig, ignore_trend)
+    st.write(summary)
+    preview_columns = active_strategy.data_requirements.get("preview_columns", [])
+    if preview_columns:
+        missing = [col for col in preview_columns if col not in df_sig.columns]
+        if missing:
+            st.dataframe(df_sig.tail(preview_rows))
+        else:
+            st.dataframe(df_sig[preview_columns].tail(preview_rows))
+    else:
+        st.dataframe(df_sig.tail(preview_rows))
 
 # -----------------------------
 # Backtest engines
@@ -572,7 +668,7 @@ if mode == "Backtest":
 
         if run_bt:
             if engine == "Simple (backtesting.py)":
-                result = run_simple_backtest(df, base_params, df_sig=df_sig)
+                result = run_simple_backtest(df, base_params, strategy=active_strategy, df_sig=df_sig)
             else:
                 result = run_true_stop_backtest(df, base_params)
 
@@ -588,7 +684,7 @@ if mode == "Backtest":
                 st.info("No closed trades for the selected parameters.")
 
             trade_markers = result.get("trade_markers", []) if show_trades else None
-            fig = plot_chart(df, ema_period_val, trade_markers, symbol)
+            fig = plot_chart(df, chart_overlays, trade_markers, symbol)
             st.plotly_chart(fig, use_container_width=True)
 
     else:
@@ -628,7 +724,7 @@ if mode == "Backtest":
                     for k, v in zip(combos_keys, combo):
                         combo_params[k] = v
                     if engine == "Simple (backtesting.py)":
-                        result = run_simple_backtest(df, combo_params)
+                        result = run_simple_backtest(df, combo_params, strategy=active_strategy)
                     else:
                         result = run_true_stop_backtest(df, combo_params)
 
@@ -668,7 +764,7 @@ if mode == "Backtest":
 
                     if st.button("Apply top parameters to controls", key="apply_best"):
                         for k, v in best_params.items():
-                            if k in PARAM_CONFIG:
+                            if k in active_strategy.controls:
                                 st.session_state[k] = v
                             elif k in {"allow_shorts", "ignore_trend", "sizing_mode"}:
                                 st.session_state[k] = v
