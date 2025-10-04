@@ -744,6 +744,15 @@ with st.sidebar:
     mode = st.radio("Mode", ["Backtest", "Dry-Run (paper)"] , index=0, key="session_mode")
     engine = st.selectbox("Backtest engine", ["Simple (backtesting.py)", "TRUE STOP (backtrader)"], index=0, key="engine")
 
+    strategy_keys = list(STRATEGY_REGISTRY.keys())
+    default_strategy_key = st.session_state.get("active_strategy", DEFAULT_STRATEGY_KEY)
+    if default_strategy_key not in STRATEGY_REGISTRY:
+        default_strategy_key = DEFAULT_STRATEGY_KEY
+    if st.session_state.get("active_strategy") not in STRATEGY_REGISTRY:
+        st.session_state["active_strategy"] = default_strategy_key
+    selected_strategy_key = st.session_state.get("active_strategy", default_strategy_key)
+    active_strategy = STRATEGY_REGISTRY.get(selected_strategy_key, STRATEGY_REGISTRY[DEFAULT_STRATEGY_KEY])
+
     st.header("Data")
     symbol_groups_spec = active_strategy.data_requirements.get("symbols", []) if active_strategy else []
     symbol_groups: Dict[str, list[str]] = {}
@@ -820,11 +829,7 @@ with st.sidebar:
         st.error("Invalid 'Since' string (e.g. 2023-01-01T00:00:00Z)")
 
     st.header("Strategy")
-    strategy_keys = list(STRATEGY_REGISTRY.keys())
-    default_strategy = st.session_state.get("active_strategy", DEFAULT_STRATEGY_KEY)
-    if default_strategy not in STRATEGY_REGISTRY:
-        default_strategy = DEFAULT_STRATEGY_KEY
-    strategy_index = strategy_keys.index(default_strategy)
+    strategy_index = strategy_keys.index(selected_strategy_key)
     selected_strategy_key = st.selectbox(
         "Strategy",
         strategy_keys,
