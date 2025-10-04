@@ -1180,6 +1180,14 @@ strategy_params = {
     "primary_symbol_group": primary_group_id,
 }
 
+is_valid, validation_message = active_strategy.validate_context(strategy_params)
+if not is_valid:
+    if validation_message:
+        st.warning(validation_message)
+    else:
+        st.warning("Strategy requirements are not met for the selected configuration.")
+    st.stop()
+
 prepared_df = active_strategy.prepare_data(df, strategy_params)
 df_sig = active_strategy.generate_signals(prepared_df, strategy_params)
 chart_overlays = _build_chart_overlays(active_strategy, df_sig, strategy_params)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Mapping, Optional
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 import pandas as pd
 
@@ -10,6 +10,7 @@ GenerateSignalsFn = Callable[[pd.DataFrame, Mapping[str, Any]], pd.DataFrame]
 BuildOrdersFn = Callable[[pd.DataFrame, pd.DataFrame, Mapping[str, Any]], Dict[str, Any]]
 SimpleBacktestBuilder = Callable[[pd.DataFrame, pd.DataFrame, Mapping[str, Any]], Any]
 TrueStopBacktestBuilder = Callable[[pd.DataFrame, pd.DataFrame, Mapping[str, Any]], Any]
+ValidateContextFn = Callable[[Mapping[str, Any]], Tuple[bool, Optional[str]]]
 
 
 def _identity_prepare(df: pd.DataFrame, _params: Mapping[str, Any]) -> pd.DataFrame:
@@ -28,6 +29,10 @@ def _identity_build_orders(
     return {}
 
 
+def _identity_validate(_params: Mapping[str, Any]) -> Tuple[bool, Optional[str]]:
+    return True, None
+
+
 @dataclass(slots=True)
 class StrategyDefinition:
     """Container describing how a trading strategy integrates with the app."""
@@ -44,6 +49,7 @@ class StrategyDefinition:
     build_orders: BuildOrdersFn = field(default_factory=lambda: _identity_build_orders)
     build_simple_backtest_strategy: Optional[SimpleBacktestBuilder] = None
     build_true_stop_strategy: Optional[TrueStopBacktestBuilder] = None
+    validate_context: ValidateContextFn = field(default_factory=lambda: _identity_validate)
 
 
 __all__ = ["StrategyDefinition"]
