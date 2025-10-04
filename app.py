@@ -1,7 +1,10 @@
 
 import itertools
+import json
 import time
-from typing import Dict, Iterable, Tuple
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, Iterable, Tuple
 
 import ccxt
 import numpy as np
@@ -127,6 +130,65 @@ def _format_label(template: str, params: Dict[str, object]) -> str:
         return template.format(**params)
     except Exception:
         return template
+
+
+_PARAM_STATE_KEY = "strategy_param_state"
+_RANGE_STATE_KEY = "strategy_range_state"
+_SYMBOL_STATE_KEY = "strategy_symbol_state"
+_RESULTS_DIR = Path("strategy_results")
+
+
+def _ensure_state_dict(key: str) -> Dict[Any, Any]:
+    value = st.session_state.get(key)
+    if not isinstance(value, dict):
+        st.session_state[key] = {}
+    return st.session_state[key]
+
+
+def _get_param_store() -> Dict[tuple[str, str], Any]:
+    return _ensure_state_dict(_PARAM_STATE_KEY)
+
+
+def _get_range_store() -> Dict[tuple[str, str], Dict[str, Any]]:
+    return _ensure_state_dict(_RANGE_STATE_KEY)
+
+
+def _get_symbol_store() -> Dict[tuple[str, str], Any]:
+    return _ensure_state_dict(_SYMBOL_STATE_KEY)
+
+
+def _get_param_value(strategy_key: str, param_name: str, default: Any) -> Any:
+    store = _get_param_store()
+    return store.get((strategy_key, param_name), default)
+
+
+def _set_param_value(strategy_key: str, param_name: str, value: Any) -> None:
+    store = _get_param_store()
+    store[(strategy_key, param_name)] = value
+
+
+def _get_range_spec(strategy_key: str, param_name: str) -> Dict[str, Any] | None:
+    store = _get_range_store()
+    return store.get((strategy_key, param_name))
+
+
+def _set_range_spec(strategy_key: str, param_name: str, spec: Dict[str, Any] | None) -> None:
+    store = _get_range_store()
+    key = (strategy_key, param_name)
+    if spec is None:
+        store.pop(key, None)
+    else:
+        store[key] = spec
+
+
+def _set_symbol_value(strategy_key: str, symbol_id: str, value: Any) -> None:
+    store = _get_symbol_store()
+    store[(strategy_key, symbol_id)] = value
+
+
+def _get_symbol_value(strategy_key: str, symbol_id: str, default: Any) -> Any:
+    store = _get_symbol_store()
+    return store.get((strategy_key, symbol_id), default)
 
 
 def _build_chart_overlays(
@@ -560,7 +622,23 @@ def run_true_stop_backtest(
     }
 
 
-def render_scalar_or_range(label: str, key: str, mode: str, *, min_value, max_value, value, step, dtype=float, slider=False, format: str | None = None):
+def render_scalar_or_range(
+    label: str,
+    key: str,
+    mode: str,
+    *,
+    min_value,
+    max_value,
+    value,
+    step,
+    dtype=float,
+    slider=False,
+    format: str | None = None,
+    range_defaults: Dict[str, Any] | None = None,
+    stored_range: Dict[str, Any] | None = None,
+):
+    range_seed = stored_range or range_defaults or {}
+    dtype = range_seed.get("dtype", dtype)
     if dtype is int:
         min_value = int(min_value)
         max_value = int(max_value)
@@ -575,20 +653,47 @@ def render_scalar_or_range(label: str, key: str, mode: str, *, min_value, max_va
             kwargs["format"] = format
         return st.number_input(label, **kwargs), None
 
+    current_min = range_seed.get("min", value)
+    current_max = range_seed.get("max", value)
+    current_step = range_seed.get("step", step)
+
+    if dtype is int:
+        current_min = int(current_min)
+        current_max = int(current_max)
+        current_step = max(1, int(current_step))
+    else:
+        current_min = float(current_min)
+        current_max = float(current_max)
+        current_step = float(current_step) if current_step else float(step)
+
     cols = st.columns(3)
     with cols[0]:
-        min_kwargs = dict(min_value=min_value, max_value=max_value, value=value, step=step, key=f"{key}_min")
+        min_kwargs = dict(
+            min_value=min_value,
+            max_value=max_value,
+            value=max(min_value, min(current_min, max_value)),
+            step=step,
+            key=f"{key}__min",
+        )
         if format is not None:
             min_kwargs["format"] = format
         min_val = st.number_input(f"{label} min", **min_kwargs)
     with cols[1]:
-        max_kwargs = dict(min_value=min_val, max_value=max_value, value=max(value, min_val), step=step, key=f"{key}_max")
+        max_default = max(min_val, min(current_max, max_value))
+        max_kwargs = dict(
+            min_value=min_val,
+            max_value=max_value,
+            value=max_default,
+            step=step,
+            key=f"{key}__max",
+        )
         if format is not None:
             max_kwargs["format"] = format
         max_val = st.number_input(f"{label} max", **max_kwargs)
     with cols[2]:
-        range_step_default = step
-        step_kwargs = dict(min_value=step, value=range_step_default, key=f"{key}_step")
+        min_step = 1 if dtype is int else step
+        step_default = max(min_step, current_step)
+        step_kwargs = dict(min_value=min_step, value=step_default, key=f"{key}__step")
         if dtype is int:
             step_kwargs["step"] = 1
             step_kwargs["max_value"] = max(1, max_val - min_val)
@@ -640,7 +745,71 @@ with st.sidebar:
     engine = st.selectbox("Backtest engine", ["Simple (backtesting.py)", "TRUE STOP (backtrader)"], index=0, key="engine")
 
     st.header("Data")
-    symbol = st.text_input("Symbol (Kraken/ccxt)", value=st.session_state.get("symbol", "BTC/EUR"), key="symbol")
+    symbol_groups_spec = active_strategy.data_requirements.get("symbols", []) if active_strategy else []
+    symbol_groups: Dict[str, list[str]] = {}
+    primary_symbol = None
+    primary_group_id = "primary"
+    if not symbol_groups_spec:
+        default_symbol = _get_symbol_value(selected_strategy_key, "primary", st.session_state.get("symbol", "BTC/EUR"))
+        if isinstance(default_symbol, (list, tuple)):
+            default_symbol = default_symbol[0] if default_symbol else ""
+        symbol_key = f"symbol_input::{selected_strategy_key}::primary"
+        if symbol_key not in st.session_state:
+            st.session_state[symbol_key] = str(default_symbol or "")
+        symbol_value = st.text_input("Symbol (Kraken/ccxt)", key=symbol_key)
+        symbol_clean = symbol_value.strip()
+        if symbol_clean:
+            symbol_groups["primary"] = [symbol_clean]
+            primary_symbol = symbol_clean
+        else:
+            st.error("Please provide a symbol to proceed.")
+            st.stop()
+        _set_symbol_value(selected_strategy_key, "primary", [symbol_clean])
+    else:
+        for idx, spec in enumerate(symbol_groups_spec):
+            spec_id = str(spec.get("id") or spec.get("key") or spec.get("label") or f"group_{idx}")
+            if idx == 0:
+                primary_group_id = spec_id
+            label = spec.get("label", spec_id.replace("_", " ").title())
+            multiple = bool(spec.get("multiple", False))
+            required = spec.get("required", True)
+            default_value = spec.get("default", [] if multiple else "")
+            stored_value = _get_symbol_value(selected_strategy_key, spec_id, default_value)
+            if multiple:
+                if isinstance(stored_value, str):
+                    stored_list = [stored_value]
+                else:
+                    stored_list = list(stored_value or [])
+                default_text = ", ".join(stored_list)
+            else:
+                if isinstance(stored_value, (list, tuple)):
+                    stored_list = list(stored_value)
+                    default_text = stored_list[0] if stored_list else ""
+                else:
+                    default_text = str(stored_value or "")
+            input_key = f"symbol_input::{selected_strategy_key}::{spec_id}"
+            if input_key not in st.session_state:
+                st.session_state[input_key] = default_text
+            raw_value = st.text_input(label, key=input_key)
+            if multiple:
+                entries = [s.strip() for s in raw_value.split(",") if s.strip()]
+                _set_symbol_value(selected_strategy_key, spec_id, entries)
+            else:
+                entries = [raw_value.strip()] if raw_value.strip() else []
+                _set_symbol_value(selected_strategy_key, spec_id, entries[0] if entries else "")
+            if required and not entries:
+                st.error(f"Please provide at least one symbol for '{label}'.")
+                st.stop()
+            symbol_groups[spec_id] = entries
+            if primary_symbol is None and entries:
+                primary_symbol = entries[0]
+
+    if not primary_symbol:
+        st.error("No primary symbol resolved for the selected strategy.")
+        st.stop()
+
+    symbol = primary_symbol
+    st.session_state["symbol"] = symbol
     timeframe = st.selectbox("Timeframe", ["1h", "4h", "1d"], index=["1h", "4h", "1d"].index(st.session_state.get("timeframe", "1h")), key="timeframe")
     since_str = st.text_input("Since (UTC ISO8601)", value=st.session_state.get("since_str", "2022-01-01T00:00:00Z"), key="since_str")
     ex = ccxt.kraken()
@@ -668,27 +837,130 @@ with st.sidebar:
         st.caption(active_strategy.description)
 
     st.header("Strategy Parameters")
-    scalar_params = {}
-    range_specs = {}
+    scalar_params: Dict[str, Any] = {}
+    range_specs: Dict[str, Dict[str, Any]] = {}
+    range_defaults_map = getattr(active_strategy, "range_controls", {}) or {}
     for key, cfg in active_strategy.controls.items():
-        default_value = st.session_state.get(key, cfg.get("value"))
+        default_value = cfg.get("value")
+        stored_value = _get_param_value(selected_strategy_key, key, default_value)
+        widget_key = f"ctrl::{selected_strategy_key}::{key}"
+        range_defaults = range_defaults_map.get(key)
+        stored_range = _get_range_spec(selected_strategy_key, key)
         value, range_spec = render_scalar_or_range(
             cfg["label"],
-            key,
+            widget_key,
             run_mode,
             min_value=cfg["min"],
             max_value=cfg["max"],
-            value=default_value,
+            value=stored_value,
             step=cfg["step"],
             dtype=cfg.get("dtype", float),
             slider=cfg.get("slider", False),
             format=cfg.get("format"),
+            range_defaults=range_defaults,
+            stored_range=stored_range,
         )
         if range_spec is None:
             scalar_params[key] = value
+            _set_param_value(selected_strategy_key, key, value)
+            _set_range_spec(selected_strategy_key, key, None)
         else:
             scalar_params[key] = range_spec["min"]
+            _set_param_value(selected_strategy_key, key, range_spec.get("min", stored_value))
+            _set_range_spec(selected_strategy_key, key, range_spec)
             range_specs[key] = range_spec
+
+    for key, default_spec in range_defaults_map.items():
+        if not default_spec:
+            continue
+        if key not in range_specs:
+            stored_range = _get_range_spec(selected_strategy_key, key)
+            if stored_range is not None:
+                range_specs[key] = dict(stored_range)
+            else:
+                range_specs[key] = dict(default_spec)
+
+    preset_params = {
+        key: _get_param_value(selected_strategy_key, key, cfg.get("value"))
+        for key, cfg in active_strategy.controls.items()
+    }
+    preset_ranges_raw = {
+        key: spec
+        for key, spec in ((_key, _get_range_spec(selected_strategy_key, _key)) for _key in active_strategy.controls.keys())
+        if spec is not None
+    }
+    preset_payload = {
+        "strategy": selected_strategy_key,
+        "saved_at": datetime.utcnow().isoformat() + "Z",
+        "params": preset_params,
+    }
+    if preset_ranges_raw:
+        serializable_ranges: Dict[str, Dict[str, Any]] = {}
+        for param_name, spec in preset_ranges_raw.items():
+            cleaned = dict(spec)
+            dtype_value = cleaned.get("dtype")
+            if dtype_value is not None:
+                cleaned["dtype"] = getattr(dtype_value, "__name__", str(dtype_value))
+            serializable_ranges[param_name] = cleaned
+        preset_payload["ranges"] = serializable_ranges
+    preset_bytes = json.dumps(preset_payload, indent=2).encode("utf-8")
+    preset_cols = st.columns([1, 1])
+    with preset_cols[0]:
+        st.download_button(
+            "💾 Save preset",
+            data=preset_bytes,
+            file_name=f"{selected_strategy_key}_params.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+    with preset_cols[1]:
+        uploaded_preset = st.file_uploader(
+            "Load preset",
+            type="json",
+            key=f"preset_uploader::{selected_strategy_key}",
+            label_visibility="collapsed",
+        )
+        if uploaded_preset is not None:
+            try:
+                loaded = json.load(uploaded_preset)
+            except Exception as exc:
+                st.error(f"Failed to read preset: {exc}")
+            else:
+                target_strategy = loaded.get("strategy", selected_strategy_key)
+                if target_strategy != selected_strategy_key:
+                    st.warning(
+                        f"Preset belongs to strategy '{target_strategy}'. Applying overlapping parameters only.",
+                        icon="⚠️",
+                    )
+                loaded_params = loaded.get("params", {}) or {}
+                loaded_ranges = loaded.get("ranges", {}) or {}
+                for param_name, param_value in loaded_params.items():
+                    if param_name not in active_strategy.controls:
+                        continue
+                    _set_param_value(selected_strategy_key, param_name, param_value)
+                    _set_range_spec(selected_strategy_key, param_name, None)
+                    st.session_state[f"ctrl::{selected_strategy_key}::{param_name}"] = param_value
+                for param_name, range_spec in loaded_ranges.items():
+                    if param_name not in active_strategy.controls:
+                        continue
+                    if isinstance(range_spec, dict) and "dtype" in range_spec:
+                        dtype_token = range_spec["dtype"]
+                        if dtype_token in {int, float}:
+                            dtype_obj = dtype_token
+                        elif str(dtype_token).lower() in {"int", "integer"}:
+                            dtype_obj = int
+                        elif str(dtype_token).lower() in {"float", "double"}:
+                            dtype_obj = float
+                        else:
+                            dtype_obj = float
+                        range_spec = {**range_spec, "dtype": dtype_obj}
+                    _set_range_spec(selected_strategy_key, param_name, range_spec)
+                    base_key = f"ctrl::{selected_strategy_key}::{param_name}"
+                    st.session_state.pop(f"{base_key}__min", None)
+                    st.session_state.pop(f"{base_key}__max", None)
+                    st.session_state.pop(f"{base_key}__step", None)
+                st.success("Preset loaded. Refreshing controls...")
+                st.experimental_rerun()
 
     allow_shorts = st.checkbox("Allow shorts", value=st.session_state.get("allow_shorts", True), key="allow_shorts")
     ignore_trend = st.checkbox("Ignore trend filter (debug)", value=st.session_state.get("ignore_trend", False), key="ignore_trend")
@@ -842,12 +1114,31 @@ if since_ms is None:
     st.stop()
 
 with st.spinner("Fetching data..."):
-    df = fetch_ohlcv(symbol, timeframe, since_ms)
-if df.empty:
+    symbol_datasets: Dict[str, Dict[str, pd.DataFrame]] = {}
+    empty_symbols: list[tuple[str, str]] = []
+    for group_id, entries in symbol_groups.items():
+        group_frames: Dict[str, pd.DataFrame] = {}
+        for entry in entries:
+            df_entry = fetch_ohlcv(entry, timeframe, since_ms)
+            if df_entry.empty:
+                empty_symbols.append((group_id, entry))
+            else:
+                if df_entry.index.tz is None:
+                    df_entry.index = df_entry.index.tz_localize('UTC')
+            group_frames[entry] = df_entry
+        symbol_datasets[group_id] = group_frames
+
+if empty_symbols:
+    missing_descriptions = ", ".join(f"{grp}:{sym}" for grp, sym in empty_symbols)
+    st.error(
+        "No data fetched for: " + missing_descriptions + ". Try adjusting the symbol or the date range.")
+    st.stop()
+
+primary_group = symbol_datasets.get(primary_group_id, {})
+df = primary_group.get(symbol)
+if df is None or df.empty:
     st.error("No data fetched. Try: 1) symbol 'XBT/EUR', 2) earlier 'Since', 3) timeframe '1h'.")
     st.stop()
-if df.index.tz is None:
-    df.index = df.index.tz_localize('UTC')
 
 # -----------------------------
 # Data Preview
@@ -860,6 +1151,20 @@ with st.expander("Show first rows"):
 csv = df.to_csv().encode("utf-8")
 st.download_button("Download OHLCV CSV", data=csv, file_name=f"{symbol.replace('/','_')}_{timeframe}.csv", mime="text/csv")
 
+if any(
+    group_id != primary_group_id or any(sym != symbol for sym in group_frames.keys())
+    for group_id, group_frames in symbol_datasets.items()
+):
+    with st.expander("Additional symbol datasets"):
+        for group_id, group_frames in symbol_datasets.items():
+            for sym, sym_df in group_frames.items():
+                if group_id == primary_group_id and sym == symbol:
+                    continue
+                st.caption(
+                    f"{group_id} · {sym} — Bars: {len(sym_df):,} | Range: {sym_df.index.min()} → {sym_df.index.max()}"
+                )
+                st.dataframe(sym_df.tail(preview_rows))
+
 # -----------------------------
 # Signals
 # -----------------------------
@@ -869,6 +1174,10 @@ strategy_params = {
     "ignore_trend": ignore_trend,
     "sizing_mode": sizing_mode,
     "timeframe": timeframe,
+    "symbol_groups": symbol_groups,
+    "symbol_datasets": symbol_datasets,
+    "primary_symbol": symbol,
+    "primary_symbol_group": primary_group_id,
 }
 
 prepared_df = active_strategy.prepare_data(df, strategy_params)
@@ -904,6 +1213,10 @@ if mode == "Backtest":
         "timeframe": timeframe,
         "risk_config": risk_config,
         "symbol": symbol,
+        "primary_symbol": symbol,
+        "symbol_groups": symbol_groups,
+        "symbol_datasets": symbol_datasets,
+        "primary_symbol_group": primary_group_id,
     }
 
     if run_mode == "Single Run":
@@ -996,6 +1309,40 @@ if mode == "Backtest":
                     st.markdown("### Optimization results")
                     st.dataframe(results_df)
 
+                    try:
+                        _RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+                        output_path = _RESULTS_DIR / f"{selected_strategy_key}.json"
+                        serial_ranges: Dict[str, Dict[str, Any]] = {}
+                        for param_key, spec in range_specs.items():
+                            cleaned: Dict[str, Any] = {}
+                            for spec_key in ("min", "max", "step"):
+                                if spec_key in spec:
+                                    cleaned[spec_key] = _to_native(spec[spec_key])
+                            dtype_value = spec.get("dtype")
+                            if dtype_value is not None:
+                                cleaned["dtype"] = getattr(dtype_value, "__name__", str(dtype_value))
+                            serial_ranges[param_key] = cleaned
+
+                        serialized_results = [
+                            {k: _to_native(v) for k, v in row.items()}
+                            for row in results_df.to_dict(orient="records")
+                        ]
+                        payload = {
+                            "strategy": selected_strategy_key,
+                            "saved_at": datetime.utcnow().isoformat() + "Z",
+                            "objective": {
+                                "metric": objective_metric,
+                                "maximize": bool(maximize_objective),
+                            },
+                            "ranges": serial_ranges,
+                            "evaluations": serialized_results,
+                            "evaluated": evaluated,
+                        }
+                        output_path.write_text(json.dumps(payload, indent=2))
+                        st.caption(f"Results saved to {output_path}")
+                    except Exception as exc:
+                        st.warning(f"Failed to persist optimization results: {exc}")
+
                     best_row = results_df.iloc[0]
                     best_params = base_params.copy()
                     for k in combos_keys:
@@ -1009,7 +1356,9 @@ if mode == "Backtest":
                     if st.button("Apply top parameters to controls", key="apply_best"):
                         for k, v in best_params.items():
                             if k in active_strategy.controls:
-                                st.session_state[k] = v
+                                _set_param_value(selected_strategy_key, k, v)
+                                _set_range_spec(selected_strategy_key, k, None)
+                                st.session_state[f"ctrl::{selected_strategy_key}::{k}"] = v
                             elif k in {"allow_shorts", "ignore_trend", "sizing_mode"}:
                                 st.session_state[k] = v
                         st.experimental_rerun()
