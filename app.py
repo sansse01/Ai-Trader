@@ -9,6 +9,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from risk.engine import OrderContext, PortfolioState, RiskEngine, RiskEngineConfig
 from strategies import DEFAULT_STRATEGY_KEY, STRATEGY_REGISTRY
 from strategies.base import StrategyDefinition
 
@@ -201,12 +202,126 @@ def run_simple_backtest(
 
     strat_cls = builder(df, df_sig, base_params)
 
+    risk_cfg = RiskEngineConfig.from_params(base_params.get("risk_config"))
+    risk_engine_template = RiskEngine(risk_cfg)
+    risk_symbol = str(base_params.get("symbol", strategy.key))
+
+    class RiskManagedStrategy(strat_cls):
+        _risk_engine_template = risk_engine_template
+        _risk_symbol = risk_symbol
+
+        def init(self):
+            self._risk_engine = self._risk_engine_template.clone()
+            self._risk_engine.reset()
+            self._risk_prev_equity = None
+            self._risk_latest_state: PortfolioState | None = None
+            super().init()
+
+        def _risk_snapshot_state(self, update_return: bool) -> PortfolioState:
+            idx = self.data.index[-1]
+            price = float(self.data.Close[-1])
+            equity = float(self.equity)
+            broker_cash = float(getattr(self._broker, "_cash", 0.0))
+            position_units = float(self.position.size)
+            positions = {self._risk_symbol: position_units}
+            prices = {self._risk_symbol: price}
+            notional = abs(position_units) * price
+            gross = notional / max(equity, 1e-9)
+            net = (position_units * price) / max(equity, 1e-9)
+            if update_return:
+                prev_equity = getattr(self, "_risk_prev_equity", None)
+                if prev_equity not in (None, 0.0):
+                    ret = (equity - prev_equity) / prev_equity
+                else:
+                    ret = 0.0
+                self._risk_prev_equity = equity
+            else:
+                ret = None
+            state = PortfolioState(
+                timestamp=idx,
+                equity=equity,
+                cash=broker_cash,
+                gross_leverage=gross,
+                net_leverage=net,
+                positions=positions,
+                prices=prices,
+                return_pct=ret,
+            )
+            if update_return:
+                self._risk_latest_state = state
+            return state
+
+        def _risk_prepare_order(self, raw_size: float, direction: int, price: float):
+            state = self._risk_latest_state or self._risk_snapshot_state(update_return=False)
+            fractional = -1 < raw_size < 1
+            magnitude = abs(raw_size)
+            if fractional:
+                magnitude = magnitude * max(state.equity, 1e-9) / max(price, 1e-9)
+            current_units = state.positions.get(self._risk_symbol, 0.0)
+            projected_units = current_units + direction * magnitude
+            is_exit = abs(projected_units) < abs(current_units)
+            ctx = OrderContext(
+                symbol=self._risk_symbol,
+                direction=direction,
+                size=magnitude,
+                price=price,
+                is_exit=is_exit,
+            )
+            return ctx, fractional, state
+
+        def next(self):
+            state = self._risk_snapshot_state(update_return=True)
+            flatten = self._risk_engine.on_bar(state)
+            if flatten and self.position:
+                self.position.close()
+            super().next()
+
+        def buy(self, *, size: float = 0.9999, **kwargs):
+            if not getattr(self, "_risk_engine", None) or not self._risk_engine.enabled:
+                return super().buy(size=size, **kwargs)
+            price = float(self.data.Close[-1])
+            ctx, fractional, state = self._risk_prepare_order(float(size), 1, price)
+            decision = self._risk_engine.modify_order(ctx, state)
+            if decision.cancel or decision.size <= 0:
+                return None
+            final_size = decision.size
+            if fractional:
+                equity = max(state.equity, 1e-9)
+                final_size = min(0.9999, final_size * price / equity)
+                if final_size <= 0:
+                    return None
+            else:
+                final_size = float(round(final_size))
+                if final_size <= 0:
+                    return None
+            return super().buy(size=final_size, **kwargs)
+
+        def sell(self, *, size: float = 0.9999, **kwargs):
+            if not getattr(self, "_risk_engine", None) or not self._risk_engine.enabled:
+                return super().sell(size=size, **kwargs)
+            price = float(self.data.Close[-1])
+            ctx, fractional, state = self._risk_prepare_order(float(size), -1, price)
+            decision = self._risk_engine.modify_order(ctx, state)
+            if decision.cancel or decision.size <= 0:
+                return None
+            final_size = decision.size
+            if fractional:
+                equity = max(state.equity, 1e-9)
+                final_size = min(0.9999, final_size * price / equity)
+                if final_size <= 0:
+                    return None
+            else:
+                final_size = float(round(final_size))
+                if final_size <= 0:
+                    return None
+            return super().sell(size=final_size, **kwargs)
+
     df_bt = df[["Open", "High", "Low", "Close", "Volume"]].copy()
     df_bt[["Open", "High", "Low", "Close"]] = df_bt[["Open", "High", "Low", "Close"]] * contract_size
 
     bt = Backtest(
         df_bt,
-        strat_cls,
+        RiskManagedStrategy,
         cash=initial_cash,
         commission=(fee_percent + slippage_percent) / 100.0,
         exclusive_orders=False,
@@ -271,14 +386,94 @@ def run_true_stop_backtest(
 
     bt_strategy_cls = builder(df, df_sig, base_params)
 
-    class CashSizer(bt.Sizer):
+    risk_cfg = RiskEngineConfig.from_params(base_params.get("risk_config"))
+    risk_engine_template = RiskEngine(risk_cfg)
+
+    class RiskManagedBTStrategy(bt_strategy_cls):
+        def __init__(self, *args, **kwargs):
+            self._risk_engine = risk_engine_template.clone()
+            self._risk_engine.reset()
+            self._risk_prev_equity = None
+            self._risk_latest_state: PortfolioState | None = None
+            super().__init__(*args, **kwargs)
+
+        def _risk_snapshot_state(self, update_return: bool) -> PortfolioState:
+            equity = float(self.broker.getvalue())
+            cash = float(self.broker.getcash())
+            prices: Dict[str, float] = {}
+            positions: Dict[str, float] = {}
+            total_notional = 0.0
+            net_notional = 0.0
+            for idx, data in enumerate(self.datas):
+                symbol_name = getattr(data, "_name", None) or getattr(data, "_dataname", f"data{idx}")
+                price = float(data.close[0])
+                pos = self.getposition(data)
+                units = float(getattr(pos, "size", 0.0))
+                prices[symbol_name] = price
+                positions[symbol_name] = units
+                total_notional += abs(units) * price
+                net_notional += units * price
+            gross = total_notional / max(equity, 1e-9)
+            net = net_notional / max(equity, 1e-9)
+            if update_return:
+                prev_equity = getattr(self, "_risk_prev_equity", None)
+                if prev_equity not in (None, 0.0):
+                    ret = (equity - prev_equity) / prev_equity
+                else:
+                    ret = 0.0
+                self._risk_prev_equity = equity
+            else:
+                ret = None
+            state = PortfolioState(
+                timestamp=self.data.datetime.datetime(0),
+                equity=equity,
+                cash=cash,
+                gross_leverage=gross,
+                net_leverage=net,
+                positions=positions,
+                prices=prices,
+                return_pct=ret,
+            )
+            if update_return:
+                self._risk_latest_state = state
+            return state
+
+        def next(self):
+            state = self._risk_snapshot_state(update_return=True)
+            flatten = self._risk_engine.on_bar(state)
+            if flatten:
+                for data in self.datas:
+                    if self.getposition(data).size:
+                        self.close(data=data)
+            super().next()
+
+    class RiskAwareCashSizer(bt.Sizer):
         params = (("risk_frac", risk_fraction), ("min_unit", 0.0001), ("max_lev", max_leverage), ("retint", False))
 
         def _getsizing(self, comminfo, cash, data, isbuy):
-            price = data.close[0]
+            price = float(data.close[0])
             notional = cash * self.p.risk_frac * self.p.max_lev
             units = notional / max(price, 1e-9)
             snapped = max(self.p.min_unit, round(units / self.p.min_unit) * self.p.min_unit)
+            engine = getattr(self.strategy, "_risk_engine", None)
+            if engine and engine.enabled:
+                state = self.strategy._risk_snapshot_state(update_return=False)
+                symbol_name = getattr(data, "_name", None) or getattr(data, "_dataname", "data0")
+                current_units = state.positions.get(symbol_name, 0.0)
+                direction = 1 if isbuy else -1
+                projected_units = current_units + direction * snapped
+                is_exit = abs(projected_units) < abs(current_units)
+                ctx = OrderContext(
+                    symbol=symbol_name,
+                    direction=direction,
+                    size=snapped,
+                    price=price,
+                    is_exit=is_exit,
+                )
+                decision = engine.modify_order(ctx, state)
+                if decision.cancel or decision.size <= 0:
+                    return 0.0
+                snapped = max(self.p.min_unit, round(decision.size / self.p.min_unit) * self.p.min_unit)
             return snapped if not self.p.retint else int(snapped)
 
     cerebro = bt.Cerebro(stdstats=False)
@@ -290,8 +485,8 @@ def run_true_stop_backtest(
     comp = 60 if timeframe == "1h" else (240 if timeframe == "4h" else 1440)
     data_bt = bt.feeds.PandasData(dataname=df, timeframe=bt.TimeFrame.Minutes, compression=comp)
     cerebro.adddata(data_bt)
-    cerebro.addsizer(CashSizer)
-    cerebro.addstrategy(bt_strategy_cls)
+    cerebro.addsizer(RiskAwareCashSizer)
+    cerebro.addstrategy(RiskManagedBTStrategy)
     cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='ta')
 
     class TradeLogger(bt.Analyzer):
@@ -500,6 +695,146 @@ with st.sidebar:
 
     sizing_mode = st.selectbox("Sizing mode", ["Whole units (int)", "Fraction of equity (0-1)"] , index=["Whole units (int)", "Fraction of equity (0-1)"].index(st.session_state.get("sizing_mode", "Whole units (int)")), key="sizing_mode")
 
+    with st.expander("Risk engine", expanded=False):
+        risk_enabled = st.checkbox(
+            "Enable risk engine",
+            value=st.session_state.get("risk_enabled", True),
+            key="risk_enabled",
+        )
+        col_a, col_b = st.columns(2)
+        with col_a:
+            target_vol_pct = st.number_input(
+                "Target volatility (%)",
+                min_value=0.0,
+                max_value=200.0,
+                value=st.session_state.get("risk_target_vol", 25.0),
+                step=1.0,
+                key="risk_target_vol",
+            )
+            max_drawdown_pct = st.number_input(
+                "Max drawdown trigger (%)",
+                min_value=0.0,
+                max_value=100.0,
+                value=st.session_state.get("risk_drawdown", 20.0),
+                step=1.0,
+                key="risk_drawdown",
+            )
+            cooldown_scale = st.number_input(
+                "Cooldown scaling (0-1)",
+                min_value=0.0,
+                max_value=1.0,
+                value=st.session_state.get("risk_cooldown_scale", 0.3),
+                step=0.05,
+                key="risk_cooldown_scale",
+            )
+            rerisk_step = st.number_input(
+                "Re-risk step",
+                min_value=0.0,
+                max_value=1.0,
+                value=st.session_state.get("risk_rerisk_step", 0.1),
+                step=0.05,
+                key="risk_rerisk_step",
+            )
+        with col_b:
+            vol_lookback = st.number_input(
+                "Volatility lookback (bars)",
+                min_value=2,
+                max_value=500,
+                value=st.session_state.get("risk_vol_lookback", 20),
+                step=1,
+                key="risk_vol_lookback",
+            )
+            cooldown_bars = st.number_input(
+                "Drawdown cooldown (bars)",
+                min_value=0,
+                max_value=500,
+                value=st.session_state.get("risk_cooldown_bars", 10),
+                step=1,
+                key="risk_cooldown_bars",
+            )
+            rerisk_threshold_pct = st.number_input(
+                "Re-risk threshold (%)",
+                min_value=0.0,
+                max_value=100.0,
+                value=st.session_state.get("risk_rerisk_threshold", 5.0),
+                step=0.5,
+                key="risk_rerisk_threshold",
+            )
+            circuit_drawdown_pct = st.number_input(
+                "Circuit breaker drawdown (%)",
+                min_value=0.0,
+                max_value=100.0,
+                value=st.session_state.get("risk_cb_drawdown", 35.0),
+                step=1.0,
+                key="risk_cb_drawdown",
+            )
+        col_c, col_d = st.columns(2)
+        with col_c:
+            circuit_cooldown = st.number_input(
+                "Circuit breaker cooldown (bars)",
+                min_value=0,
+                max_value=1000,
+                value=st.session_state.get("risk_cb_cooldown", 50),
+                step=1,
+                key="risk_cb_cooldown",
+            )
+            max_gross_exposure = st.number_input(
+                "Max gross exposure (× equity)",
+                min_value=0.1,
+                max_value=10.0,
+                value=st.session_state.get("risk_max_gross", 2.0),
+                step=0.1,
+                key="risk_max_gross",
+            )
+        with col_d:
+            max_single_exposure = st.number_input(
+                "Max single exposure (× equity)",
+                min_value=0.1,
+                max_value=5.0,
+                value=st.session_state.get("risk_max_single", 1.0),
+                step=0.1,
+                key="risk_max_single",
+            )
+            correlation_threshold = st.number_input(
+                "Correlation cut threshold",
+                min_value=0.0,
+                max_value=1.0,
+                value=st.session_state.get("risk_corr_threshold", 0.85),
+                step=0.05,
+                key="risk_corr_threshold",
+            )
+            max_corr_exposure = st.number_input(
+                "Max correlated exposure (× equity)",
+                min_value=0.0,
+                max_value=5.0,
+                value=st.session_state.get("risk_corr_limit", 0.6),
+                step=0.1,
+                key="risk_corr_limit",
+            )
+        enable_corr_cuts = st.checkbox(
+            "Enable correlation cuts",
+            value=st.session_state.get("risk_corr_enabled", True),
+            key="risk_corr_enabled",
+        )
+
+    risk_config = {
+        "enabled": bool(risk_enabled),
+        "target_volatility": float(target_vol_pct) / 100.0,
+        "vol_lookback": int(vol_lookback),
+        "drawdown_limit": float(max_drawdown_pct) / 100.0,
+        "drawdown_cooldown_bars": int(cooldown_bars),
+        "cooldown_scale": float(cooldown_scale),
+        "rerisk_drawdown": float(rerisk_threshold_pct) / 100.0,
+        "rerisk_step": float(rerisk_step),
+        "circuit_breaker_drawdown": float(circuit_drawdown_pct) / 100.0,
+        "circuit_breaker_cooldown_bars": int(circuit_cooldown),
+        "max_gross_exposure": float(max_gross_exposure),
+        "max_position_exposure": float(max_single_exposure),
+        "correlation_threshold": float(correlation_threshold),
+        "max_correlation_exposure": float(max_corr_exposure),
+        "enable_correlation_cuts": bool(enable_corr_cuts),
+    }
+
     st.header("Preview")
     preview_rows = st.slider("Preview last N rows", 10, 1000, st.session_state.get("preview_rows", 50), step=10, key="preview_rows")
 
@@ -567,6 +902,8 @@ if mode == "Backtest":
         "sizing_mode": sizing_mode,
         "initial_cash": initial_cash,
         "timeframe": timeframe,
+        "risk_config": risk_config,
+        "symbol": symbol,
     }
 
     if run_mode == "Single Run":
