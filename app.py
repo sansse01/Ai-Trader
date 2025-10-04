@@ -177,93 +177,36 @@ def run_simple_backtest(
     strategy: StrategyDefinition | None = None,
     df_sig: pd.DataFrame | None = None,
 ):
-    from backtesting import Backtest, Strategy
+    from backtesting import Backtest
 
-    ema_period = int(params.get('ema_period', 9))
-    slope_lookback = int(params.get('slope_lookback', 5))
-    min_slope_percent = float(params.get('min_slope_percent', 0.1))
-    stop_loss_percent = float(params.get('stop_loss_percent', 0.0))
-    trail_percent = float(params.get('trail_percent', 0.0))
-    allow_shorts = bool(params.get('allow_shorts', True))
-    ignore_trend = bool(params.get('ignore_trend', False))
-    sizing_mode = params.get('sizing_mode', "Whole units (int)")
-    risk_fraction = float(params.get('risk_fraction', 0.25))
-    contract_size = float(params.get('contract_size', 0.001))
-    initial_cash = float(params.get('initial_cash', 10_000.0))
-    fee_percent = float(params.get('fee_percent', 0.0))
-    slippage_percent = float(params.get('slippage_percent', 0.0))
+    if strategy is None:
+        raise ValueError("Strategy definition required for backtesting.")
+
+    base_params = dict(strategy.default_params or {})
+    base_params.update(params or {})
+    if "sizing_mode" not in base_params:
+        base_params["sizing_mode"] = "Whole units (int)"
+
+    contract_size = float(base_params.get("contract_size", 0.001))
+    initial_cash = float(base_params.get("initial_cash", 10_000.0))
+    fee_percent = float(base_params.get("fee_percent", 0.0))
+    slippage_percent = float(base_params.get("slippage_percent", 0.0))
 
     if df_sig is None:
-        if strategy is None:
-            raise ValueError("Strategy definition required when signals are not provided.")
-        df_sig = strategy.generate_signals(df, params)
+        df_sig = strategy.generate_signals(df, base_params)
 
-    df_bt = df[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
-    df_bt[['Open', 'High', 'Low', 'Close']] = df_bt[['Open', 'High', 'Low', 'Close']] * contract_size
+    builder = strategy.build_simple_backtest_strategy
+    if builder is None:
+        raise ValueError(f"Strategy '{strategy.key}' does not provide a simple backtest builder.")
 
-    class Strat(Strategy):
-        def init(self):
-            self.current_sl = None
-            self.last_entry_ts = None
+    strat_cls = builder(df, df_sig, base_params)
 
-        def next(self):
-            ts = self.data.index[-1]
-            close = self.data.Close[-1]
-            row = df_sig.loc[ts]
-            min_bars = max(ema_period + 1, slope_lookback + 1)
-            if len(self.data) < min_bars or pd.isna(row['prev_close']) or pd.isna(row['prev_ema']):
-                return
-            if not self.position:
-                self.current_sl = None
-            if self.position:
-                start_ts = self.last_entry_ts or self.data.index[-1]
-                if self.position.is_long:
-                    recent_high = df.loc[start_ts: ts]['High'].max() * contract_size
-                    trail = recent_high * (1 - trail_percent / 100.0)
-                    if self.current_sl is None or trail > self.current_sl:
-                        self.current_sl = trail
-                    if self.data.Low[-1] <= self.current_sl:
-                        self.position.close()
-                        self.current_sl = None
-                        return
-                else:
-                    recent_low = df.loc[start_ts: ts]['Low'].min() * contract_size
-                    trail = recent_low * (1 + trail_percent / 100.0)
-                    if self.current_sl is None or trail < self.current_sl:
-                        self.current_sl = trail
-                    if self.data.High[-1] >= self.current_sl:
-                        self.position.close()
-                        self.current_sl = None
-                        return
-
-            go_long = row['bull_cross'] and (ignore_trend or row['trend_up'])
-            go_short = allow_shorts and row['bear_cross'] and (ignore_trend or row['trend_dn'])
-
-            if sizing_mode.startswith("Whole"):
-                cash = self.equity
-                notional = cash * risk_fraction
-                units = max(1, int(notional / max(1e-9, close)))
-                size = units
-            else:
-                size = max(0.001, min(0.99, risk_fraction))
-
-            if not self.position:
-                if go_long:
-                    sl_unscaled = df.loc[ts]['Close'] * (1 - stop_loss_percent / 100.0) if stop_loss_percent > 0 else None
-                    sl = sl_unscaled * contract_size if sl_unscaled is not None else None
-                    self.last_entry_ts = ts
-                    self.current_sl = sl
-                    self.buy(size=size, sl=sl)
-                elif go_short:
-                    sl_unscaled = df.loc[ts]['Close'] * (1 + stop_loss_percent / 100.0) if stop_loss_percent > 0 else None
-                    sl = sl_unscaled * contract_size if sl_unscaled is not None else None
-                    self.last_entry_ts = ts
-                    self.current_sl = sl
-                    self.sell(size=size, sl=sl)
+    df_bt = df[["Open", "High", "Low", "Close", "Volume"]].copy()
+    df_bt[["Open", "High", "Low", "Close"]] = df_bt[["Open", "High", "Low", "Close"]] * contract_size
 
     bt = Backtest(
         df_bt,
-        Strat,
+        strat_cls,
         cash=initial_cash,
         commission=(fee_percent + slippage_percent) / 100.0,
         exclusive_orders=False,
@@ -299,92 +242,56 @@ def run_simple_backtest(
     }
 
 
-def run_true_stop_backtest(df: pd.DataFrame, params: dict, df_sig: pd.DataFrame | None = None):
+def run_true_stop_backtest(
+    df: pd.DataFrame,
+    params: dict,
+    strategy: StrategyDefinition | None = None,
+    df_sig: pd.DataFrame | None = None,
+):
     import backtrader as bt
 
-    ema_period = int(params.get('ema_period', 9))
-    slope_lookback = int(params.get('slope_lookback', 5))
-    min_slope_percent = float(params.get('min_slope_percent', 0.1)) / 100.0
-    stop_loss_percent = float(params.get('stop_loss_percent', 0.0)) / 100.0
-    trail_percent = float(params.get('trail_percent', 0.0)) / 100.0
-    allow_shorts = bool(params.get('allow_shorts', True))
-    ignore_trend = bool(params.get('ignore_trend', False))
-    risk_fraction = float(params.get('risk_fraction', 0.25))
-    fee_percent = float(params.get('fee_percent', 0.0))
-    slippage_percent = float(params.get('slippage_percent', 0.0))
-    initial_cash = float(params.get('initial_cash', 10_000.0))
+    if strategy is None:
+        raise ValueError("Strategy definition required for backtesting.")
+
+    base_params = dict(strategy.default_params or {})
+    base_params.update(params or {})
+
+    risk_fraction = float(base_params.get("risk_fraction", 0.25))
+    max_leverage = float(base_params.get("max_leverage", 5.0))
+    fee_percent = float(base_params.get("fee_percent", 0.0))
+    slippage_percent = float(base_params.get("slippage_percent", 0.0))
+    initial_cash = float(base_params.get("initial_cash", 10_000.0))
+
+    if df_sig is None:
+        df_sig = strategy.generate_signals(df, base_params)
+
+    builder = strategy.build_true_stop_strategy
+    if builder is None:
+        raise ValueError(f"Strategy '{strategy.key}' does not provide a true stop builder.")
+
+    bt_strategy_cls = builder(df, df_sig, base_params)
 
     class CashSizer(bt.Sizer):
-        params = (('risk_frac', risk_fraction), ('min_unit', 0.0001), ('max_lev', float(params.get('max_leverage', 5.0))), ('retint', False))
+        params = (("risk_frac", risk_fraction), ("min_unit", 0.0001), ("max_lev", max_leverage), ("retint", False))
 
         def _getsizing(self, comminfo, cash, data, isbuy):
             price = data.close[0]
-            notional = cash * self.p.risk_frac * min(self.p.max_lev, float(params.get('max_leverage', 5.0)))
+            notional = cash * self.p.risk_frac * self.p.max_lev
             units = notional / max(price, 1e-9)
             snapped = max(self.p.min_unit, round(units / self.p.min_unit) * self.p.min_unit)
             return snapped if not self.p.retint else int(snapped)
-
-    class BTStrategy(bt.Strategy):
-        params = dict(
-            ema_period=ema_period,
-            slope_lb=slope_lookback,
-            min_slope=min_slope_percent,
-            stop_loss=stop_loss_percent,
-            trail=trail_percent,
-            allow_shorts=allow_shorts,
-            ignore_trend=ignore_trend,
-        )
-
-        def __init__(self):
-            self.close = self.datas[0].close
-            self.high = self.datas[0].high
-            self.low = self.datas[0].low
-            self.ema = bt.ind.EMA(self.close, period=self.p.ema_period)
-            self.prev_close = self.close(-1)
-            self.prev_ema = self.ema(-1)
-            self.ema_shift = self.ema - self.ema(-int(self.p.slope_lb))
-            self.slope_pct = self.ema_shift / bt.If(self.ema(-int(self.p.slope_lb)) == 0, 1e-9, self.ema(-int(self.p.slope_lb)))
-            self.ord = None
-
-        def next(self):
-            if self.ord:
-                return
-            bull_cross = (self.prev_close[0] <= self.prev_ema[0]) and (self.close[0] > self.ema[0])
-            bear_cross = (self.prev_close[0] >= self.prev_ema[0]) and (self.close[0] < self.ema[0])
-            trend_up = (self.slope_pct[0]) > self.p.min_slope or self.p.ignore_trend
-            trend_dn = (self.slope_pct[0]) < -self.p.min_slope or self.p.ignore_trend
-            if not self.position:
-                if bull_cross and trend_up:
-                    self.ord = self.buy()
-                    price = self.close[0]
-                    if self.p.stop_loss > 0:
-                        sl = price * (1 - self.p.stop_loss)
-                        self.sell(exectype=bt.Order.Stop, price=sl)
-                    if self.p.trail > 0:
-                        self.sell(exectype=bt.Order.StopTrail, trailpercent=self.p.trail)
-                elif self.p.allow_shorts and bear_cross and trend_dn:
-                    self.ord = self.sell()
-                    price = self.close[0]
-                    if self.p.stop_loss > 0:
-                        sl = price * (1 + self.p.stop_loss)
-                        self.buy(exectype=bt.Order.Stop, price=sl)
-                    if self.p.trail > 0:
-                        self.buy(exectype=bt.Order.StopTrail, trailpercent=self.p.trail)
-
-        def notify_order(self, order):
-            if order.status in [order.Completed, order.Canceled, order.Margin, order.Rejected]:
-                self.ord = None
 
     cerebro = bt.Cerebro(stdstats=False)
     cerebro.broker.setcommission(commission=(fee_percent + slippage_percent) / 100.0)
     cerebro.broker.set_slippage_perc(perc=slippage_percent / 100.0)
     cerebro.broker.setcash(initial_cash)
 
-    comp = 60 if params.get('timeframe') == '1h' else (240 if params.get('timeframe') == '4h' else 1440)
+    timeframe = str(base_params.get("timeframe", "1h"))
+    comp = 60 if timeframe == "1h" else (240 if timeframe == "4h" else 1440)
     data_bt = bt.feeds.PandasData(dataname=df, timeframe=bt.TimeFrame.Minutes, compression=comp)
     cerebro.adddata(data_bt)
     cerebro.addsizer(CashSizer)
-    cerebro.addstrategy(BTStrategy)
+    cerebro.addstrategy(bt_strategy_cls)
     cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='ta')
 
     class TradeLogger(bt.Analyzer):
@@ -670,7 +577,7 @@ if mode == "Backtest":
             if engine == "Simple (backtesting.py)":
                 result = run_simple_backtest(df, base_params, strategy=active_strategy, df_sig=df_sig)
             else:
-                result = run_true_stop_backtest(df, base_params)
+                result = run_true_stop_backtest(df, base_params, strategy=active_strategy, df_sig=df_sig)
 
             metrics_series = pd.Series(result["metrics"])
             st.markdown("### Summary metrics")
@@ -726,7 +633,7 @@ if mode == "Backtest":
                     if engine == "Simple (backtesting.py)":
                         result = run_simple_backtest(df, combo_params, strategy=active_strategy)
                     else:
-                        result = run_true_stop_backtest(df, combo_params)
+                        result = run_true_stop_backtest(df, combo_params, strategy=active_strategy)
 
                     metrics = result.get("metrics", {})
                     objective_value = metrics.get(objective_metric)
