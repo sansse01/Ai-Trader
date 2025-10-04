@@ -36,7 +36,7 @@ class StrategyDefinition:
     name: str
     description: str = ""
     controls: Dict[str, Dict[str, Any]] = field(default_factory=dict)
-    ranges: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    range_controls: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     default_params: Dict[str, Any] = field(default_factory=dict)
     data_requirements: Dict[str, Any] = field(default_factory=dict)
     prepare_data: PrepareDataFn = field(default_factory=lambda: _identity_prepare)

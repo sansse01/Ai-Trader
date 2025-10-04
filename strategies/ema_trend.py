@@ -271,7 +271,7 @@ EMA_STRATEGY = StrategyDefinition(
             ),
         }
     ),
-    ranges={},
+    range_controls={},
     default_params=DEFAULT_PARAMS,
     data_requirements={
         "chart_overlays": [
