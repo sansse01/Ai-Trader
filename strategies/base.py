@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Mapping
+from typing import Any, Callable, Dict, Mapping, Optional
 
 import pandas as pd
 
 PrepareDataFn = Callable[[pd.DataFrame, Mapping[str, Any]], pd.DataFrame]
 GenerateSignalsFn = Callable[[pd.DataFrame, Mapping[str, Any]], pd.DataFrame]
 BuildOrdersFn = Callable[[pd.DataFrame, pd.DataFrame, Mapping[str, Any]], Dict[str, Any]]
+SimpleBacktestBuilder = Callable[[pd.DataFrame, pd.DataFrame, Mapping[str, Any]], Any]
+TrueStopBacktestBuilder = Callable[[pd.DataFrame, pd.DataFrame, Mapping[str, Any]], Any]
 
 
 def _identity_prepare(df: pd.DataFrame, _params: Mapping[str, Any]) -> pd.DataFrame:
@@ -35,10 +37,13 @@ class StrategyDefinition:
     description: str = ""
     controls: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     ranges: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    default_params: Dict[str, Any] = field(default_factory=dict)
     data_requirements: Dict[str, Any] = field(default_factory=dict)
     prepare_data: PrepareDataFn = field(default_factory=lambda: _identity_prepare)
     generate_signals: GenerateSignalsFn = field(default_factory=lambda: _identity_signals)
     build_orders: BuildOrdersFn = field(default_factory=lambda: _identity_build_orders)
+    build_simple_backtest_strategy: Optional[SimpleBacktestBuilder] = None
+    build_true_stop_strategy: Optional[TrueStopBacktestBuilder] = None
 
 
 __all__ = ["StrategyDefinition"]
