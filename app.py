@@ -239,6 +239,7 @@ def run_simple_backtest(
     params: dict,
     strategy: StrategyDefinition | None = None,
     df_sig: pd.DataFrame | None = None,
+    df_prepared: pd.DataFrame | None = None,
 ):
     from backtesting import Backtest
 
@@ -255,14 +256,15 @@ def run_simple_backtest(
     fee_percent = float(base_params.get("fee_percent", 0.0))
     slippage_percent = float(base_params.get("slippage_percent", 0.0))
 
+    prepared_df = df_prepared if df_prepared is not None else strategy.prepare_data(df, base_params)
     if df_sig is None:
-        df_sig = strategy.generate_signals(df, base_params)
+        df_sig = strategy.generate_signals(prepared_df, base_params)
 
     builder = strategy.build_simple_backtest_strategy
     if builder is None:
         raise ValueError(f"Strategy '{strategy.key}' does not provide a simple backtest builder.")
 
-    strat_cls = builder(df, df_sig, base_params)
+    strat_cls = builder(prepared_df, df_sig, base_params)
 
     risk_cfg = RiskEngineConfig.from_params(base_params.get("risk_config"))
     risk_engine_template = RiskEngine(risk_cfg)
@@ -378,7 +380,7 @@ def run_simple_backtest(
                     return None
             return super().sell(size=final_size, **kwargs)
 
-    df_bt = df[["Open", "High", "Low", "Close", "Volume"]].copy()
+    df_bt = prepared_df[["Open", "High", "Low", "Close", "Volume"]].copy()
     df_bt[["Open", "High", "Low", "Close"]] = df_bt[["Open", "High", "Low", "Close"]] * contract_size
 
     bt = Backtest(
@@ -424,6 +426,7 @@ def run_true_stop_backtest(
     params: dict,
     strategy: StrategyDefinition | None = None,
     df_sig: pd.DataFrame | None = None,
+    df_prepared: pd.DataFrame | None = None,
 ):
     import backtrader as bt
 
@@ -439,14 +442,15 @@ def run_true_stop_backtest(
     slippage_percent = float(base_params.get("slippage_percent", 0.0))
     initial_cash = float(base_params.get("initial_cash", 10_000.0))
 
+    prepared_df = df_prepared if df_prepared is not None else strategy.prepare_data(df, base_params)
     if df_sig is None:
-        df_sig = strategy.generate_signals(df, base_params)
+        df_sig = strategy.generate_signals(prepared_df, base_params)
 
     builder = strategy.build_true_stop_strategy
     if builder is None:
         raise ValueError(f"Strategy '{strategy.key}' does not provide a true stop builder.")
 
-    bt_strategy_cls = builder(df, df_sig, base_params)
+    bt_strategy_cls = builder(prepared_df, df_sig, base_params)
 
     risk_cfg = RiskEngineConfig.from_params(base_params.get("risk_config"))
     risk_engine_template = RiskEngine(risk_cfg)
@@ -545,7 +549,9 @@ def run_true_stop_backtest(
 
     timeframe = str(base_params.get("timeframe", "1h"))
     comp = 60 if timeframe == "1h" else (240 if timeframe == "4h" else 1440)
-    data_bt = bt.feeds.PandasData(dataname=df, timeframe=bt.TimeFrame.Minutes, compression=comp)
+    data_bt = bt.feeds.PandasData(
+        dataname=prepared_df, timeframe=bt.TimeFrame.Minutes, compression=comp
+    )
     cerebro.adddata(data_bt)
     cerebro.addsizer(RiskAwareCashSizer)
     cerebro.addstrategy(RiskManagedBTStrategy)
@@ -744,22 +750,14 @@ with st.sidebar:
     mode = st.radio("Mode", ["Backtest", "Dry-Run (paper)"] , index=0, key="session_mode")
     engine = st.selectbox("Backtest engine", ["Simple (backtesting.py)", "TRUE STOP (backtrader)"], index=0, key="engine")
 
-    st.header("Strategy")
     strategy_keys = list(STRATEGY_REGISTRY.keys())
-    default_strategy = st.session_state.get("active_strategy", DEFAULT_STRATEGY_KEY)
-    if default_strategy not in STRATEGY_REGISTRY:
-        default_strategy = DEFAULT_STRATEGY_KEY
-    strategy_index = strategy_keys.index(default_strategy)
-    selected_strategy_key = st.selectbox(
-        "Strategy",
-        strategy_keys,
-        index=strategy_index,
-        format_func=lambda key: STRATEGY_REGISTRY[key].name,
-        key="active_strategy",
-    )
-    active_strategy = STRATEGY_REGISTRY[selected_strategy_key]
-    if active_strategy.description:
-        st.caption(active_strategy.description)
+    default_strategy_key = st.session_state.get("active_strategy", DEFAULT_STRATEGY_KEY)
+    if default_strategy_key not in STRATEGY_REGISTRY:
+        default_strategy_key = DEFAULT_STRATEGY_KEY
+    if st.session_state.get("active_strategy") not in STRATEGY_REGISTRY:
+        st.session_state["active_strategy"] = default_strategy_key
+    selected_strategy_key = st.session_state.get("active_strategy", default_strategy_key)
+    active_strategy = STRATEGY_REGISTRY.get(selected_strategy_key, STRATEGY_REGISTRY[DEFAULT_STRATEGY_KEY])
 
     st.header("Data")
     symbol_groups_spec = active_strategy.data_requirements.get("symbols", []) if active_strategy else []
@@ -835,6 +833,19 @@ with st.sidebar:
     except Exception:
         since_ms = None
         st.error("Invalid 'Since' string (e.g. 2023-01-01T00:00:00Z)")
+
+    st.header("Strategy")
+    strategy_index = strategy_keys.index(selected_strategy_key)
+    selected_strategy_key = st.selectbox(
+        "Strategy",
+        strategy_keys,
+        index=strategy_index,
+        format_func=lambda key: STRATEGY_REGISTRY[key].name,
+        key="active_strategy",
+    )
+    active_strategy = STRATEGY_REGISTRY[selected_strategy_key]
+    if active_strategy.description:
+        st.caption(active_strategy.description)
 
     st.header("Strategy Parameters")
     scalar_params: Dict[str, Any] = {}
@@ -1180,6 +1191,14 @@ strategy_params = {
     "primary_symbol_group": primary_group_id,
 }
 
+is_valid, validation_message = active_strategy.validate_context(strategy_params)
+if not is_valid:
+    if validation_message:
+        st.warning(validation_message)
+    else:
+        st.warning("Strategy requirements are not met for the selected configuration.")
+    st.stop()
+
 prepared_df = active_strategy.prepare_data(df, strategy_params)
 df_sig = active_strategy.generate_signals(prepared_df, strategy_params)
 chart_overlays = _build_chart_overlays(active_strategy, df_sig, strategy_params)
@@ -1225,9 +1244,21 @@ if mode == "Backtest":
 
         if run_bt:
             if engine == "Simple (backtesting.py)":
-                result = run_simple_backtest(df, base_params, strategy=active_strategy, df_sig=df_sig)
+                result = run_simple_backtest(
+                    df,
+                    base_params,
+                    strategy=active_strategy,
+                    df_sig=df_sig,
+                    df_prepared=prepared_df,
+                )
             else:
-                result = run_true_stop_backtest(df, base_params, strategy=active_strategy, df_sig=df_sig)
+                result = run_true_stop_backtest(
+                    df,
+                    base_params,
+                    strategy=active_strategy,
+                    df_sig=df_sig,
+                    df_prepared=prepared_df,
+                )
 
             metrics_series = pd.Series(result["metrics"])
             st.markdown("### Summary metrics")
@@ -1281,9 +1312,19 @@ if mode == "Backtest":
                     for k, v in zip(combos_keys, combo):
                         combo_params[k] = v
                     if engine == "Simple (backtesting.py)":
-                        result = run_simple_backtest(df, combo_params, strategy=active_strategy)
+                        result = run_simple_backtest(
+                            df,
+                            combo_params,
+                            strategy=active_strategy,
+                            df_prepared=None,
+                        )
                     else:
-                        result = run_true_stop_backtest(df, combo_params, strategy=active_strategy)
+                        result = run_true_stop_backtest(
+                            df,
+                            combo_params,
+                            strategy=active_strategy,
+                            df_prepared=None,
+                        )
 
                     metrics = result.get("metrics", {})
                     objective_value = metrics.get(objective_metric)
