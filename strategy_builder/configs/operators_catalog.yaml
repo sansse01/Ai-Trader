@@ -1,0 +1,92 @@
+operators:
+  EMA:
+    type: indicator
+    inputs: 0
+    params:
+      period:
+        min: 2
+        max: 400
+  SMA:
+    type: indicator
+    inputs: 0
+    params:
+      period:
+        min: 2
+        max: 400
+  RSI:
+    type: indicator
+    inputs: 0
+    params:
+      period:
+        min: 5
+        max: 60
+  Donchian:
+    type: indicator
+    inputs: 0
+    params:
+      period:
+        min: 10
+        max: 120
+  ATR:
+    type: indicator
+    inputs: 0
+    params:
+      period:
+        min: 5
+        max: 50
+  BB:
+    type: indicator
+    inputs: 0
+    params:
+      period:
+        min: 5
+        max: 80
+      std_mult:
+        min: 1.0
+        max: 4.0
+  ADX:
+    type: indicator
+    inputs: 0
+    params:
+      period:
+        min: 5
+        max: 50
+  CrossOver:
+    type: signal
+    inputs: 2
+  Greater:
+    type: signal
+    inputs: 2
+  And:
+    type: signal
+    inputs: "1-4"
+  Or:
+    type: signal
+    inputs: "1-4"
+  PositionLong:
+    type: position
+    inputs: 1
+  PositionFlat:
+    type: position
+    inputs: 0
+  StopATR:
+    type: risk
+    inputs: "0-1"
+    params:
+      multiple:
+        min: 0.5
+        max: 6.0
+  TrailATR:
+    type: risk
+    inputs: "0-1"
+    params:
+      multiple:
+        min: 0.5
+        max: 6.0
+  RiskCaps:
+    type: risk
+    inputs: 0
+    params:
+      max_dd:
+        min: 0.05
+        max: 0.2
