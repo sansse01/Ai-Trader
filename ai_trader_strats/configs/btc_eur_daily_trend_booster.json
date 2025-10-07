@@ -1,0 +1,17 @@
+{
+  "name": "btc_eur_daily_trend_booster",
+  "symbol": "BTC/EUR",
+  "bar_interval": "1d",
+  "filters_sma_len": 200,
+  "filters_donchian_len": 55,
+  "pos_strong": 1.3,
+  "pos_weak": 0.3,
+  "max_leverage": 1.5,
+  "fees": { "fees_bps_per_side": 5 },
+  "risk": {
+    "dd_lock_pct": -0.095,
+    "daily_loss_lock_pct": -0.02,
+    "single_asset_cap_pct": 0.25,
+    "gross_cap_pct": 1.5
+  }
+}
