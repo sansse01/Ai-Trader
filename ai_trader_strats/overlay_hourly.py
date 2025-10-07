@@ -75,9 +75,24 @@ class HourlyTrendOverlay(bt.Strategy):
         self.p.max_total = cfg.max_total_leverage
         self.p.fees_bps = cfg.fees.fees_bps_per_side
 
-        self.fast = bt.indicators.ExponentialMovingAverage(self.data.close, period=self.p.ema_fast)
-        self.slow = bt.indicators.ExponentialMovingAverage(self.data.close, period=self.p.ema_slow)
-        self.donch = PreviousDonchianHigh(self.data.high, period=self.p.don)
+        try:
+            hourly_data = self.getdatabyname("hourly")
+        except KeyError:
+            if len(self.datas) >= 2:
+                hourly_data = self.datas[1]
+            else:
+                raise ValueError(
+                    "HourlyTrendOverlay requires an hourly data feed added after the daily feed"
+                )
+        self._hourly_data: bt.LineIterator = hourly_data
+
+        self.fast = bt.indicators.ExponentialMovingAverage(
+            self._hourly_data.close, period=self.p.ema_fast
+        )
+        self.slow = bt.indicators.ExponentialMovingAverage(
+            self._hourly_data.close, period=self.p.ema_slow
+        )
+        self.donch = PreviousDonchianHigh(self._hourly_data.high, period=self.p.don)
 
         self.metrics = OverlayMetrics()
         self._last_target: float = 0.0
@@ -96,20 +111,20 @@ class HourlyTrendOverlay(bt.Strategy):
         )
 
     def next(self) -> None:  # type: ignore[override]
-        dt: datetime = self.data.datetime.datetime(0)
+        dt: datetime = self._hourly_data.datetime.datetime(0)
         self.risk.update_clock(dt)
         equity = float(self.broker.getvalue())
         self.metrics.update_equity(equity)
 
-        price = float(self.data.close[0])
-        position = self.getposition(self.data)
+        price = float(self._hourly_data.close[0])
+        position = self.getposition(self._hourly_data)
         notional = (position.size * price) / equity if equity else 0.0
         self.metrics.track_position(notional)
 
         if self.risk.locked():
             if abs(position.size) > 1e-8:
                 _LOGGER.info("Risk lock active; overlay flattening")
-                rebalance_to_notional(self, 0.0, self.p.fees_bps)
+                rebalance_to_notional(self, 0.0, self.p.fees_bps, data=self._hourly_data)
             if self.context is not None:
                 self.context.update_overlay(0.0)
             self._last_target = 0.0
@@ -117,7 +132,9 @@ class HourlyTrendOverlay(bt.Strategy):
 
         overlay_allowed = bool(self.context and self.context.daily_is_strong())
         overlay_signal = False
-        if overlay_allowed and len(self.data) >= max(self.p.ema_fast, self.p.ema_slow, self.p.don) + 1:
+        if overlay_allowed and len(self._hourly_data) >= max(
+            self.p.ema_fast, self.p.ema_slow, self.p.don
+        ) + 1:
             overlay_signal = bool(
                 float(self.fast[0]) > float(self.slow[0]) and price > float(self.donch[0])
             )
@@ -130,7 +147,7 @@ class HourlyTrendOverlay(bt.Strategy):
         target = min(target, self.p.max_total)
         target = self.risk.enforce_caps(target)
 
-        order = rebalance_to_notional(self, target, self.p.fees_bps)
+        order = rebalance_to_notional(self, target, self.p.fees_bps, data=self._hourly_data)
         if order is not None:
             _LOGGER.info(
                 "Overlay targeting %.2fx (base=%.2f overlay=%.2f)",

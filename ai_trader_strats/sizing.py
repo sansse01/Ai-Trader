@@ -10,7 +10,11 @@ _LOGGER = logging.getLogger(__name__)
 
 
 def rebalance_to_notional(
-    strategy: bt.Strategy, target_notional: float, fees_bps: int
+    strategy: bt.Strategy,
+    target_notional: float,
+    fees_bps: int,
+    *,
+    data: bt.LineIterator | None = None,
 ) -> Optional[bt.Order]:
     """Rebalance the instrument to the desired notional exposure.
 
@@ -22,6 +26,8 @@ def rebalance_to_notional(
         Desired notional exposure expressed as a multiple of account equity.
     fees_bps:
         Trading fee in basis points per side.
+    data:
+        Optional data feed to rebalance; defaults to the strategy's primary data feed.
 
     Returns
     -------
@@ -29,14 +35,14 @@ def rebalance_to_notional(
         The generated order, ``None`` when no trade is required.
     """
 
-    data = strategy.data0
-    price = float(data.close[0])
+    data_feed = data if data is not None else strategy.data0
+    price = float(data_feed.close[0])
     equity = float(strategy.broker.getvalue())
     if equity <= 0 or price <= 0:
         _LOGGER.debug("Skipping rebalance due to non-positive equity=%.4f price=%.4f", equity, price)
         return None
 
-    position = strategy.getposition(data)
+    position = strategy.getposition(data_feed)
     current_size = float(getattr(position, "size", 0.0))
     current_value = current_size * price
     current_notional = current_value / equity if equity else 0.0
@@ -60,7 +66,7 @@ def rebalance_to_notional(
         target_notional,
         delta_size,
     )
-    order = strategy.order_target_size(data=data, target=target_size)
+    order = strategy.order_target_size(data=data_feed, target=target_size)
     return order
 
 

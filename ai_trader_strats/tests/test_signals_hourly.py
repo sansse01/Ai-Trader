@@ -21,6 +21,11 @@ def _run_overlay_strategy(prices: np.ndarray, context: Context) -> HourlyTrendOv
         },
         index=dates,
     )
+    daily_df = df.resample("1D").last().copy()
+    daily_df["Open"] = daily_df["Close"]
+    daily_df["High"] = daily_df["Close"]
+    daily_df["Low"] = daily_df["Close"]
+    daily_df["Volume"] = 10.0
     cfg = OverlayHourlyConfig(
         ema_fast=4,
         ema_slow=12,
@@ -32,7 +37,8 @@ def _run_overlay_strategy(prices: np.ndarray, context: Context) -> HourlyTrendOv
     cerebro = bt.Cerebro()
     cerebro.broker.setcash(100_000)
     cerebro.broker.setcommission(0.0)
-    cerebro.adddata(bt.feeds.PandasData(dataname=df))
+    cerebro.adddata(bt.feeds.PandasData(dataname=daily_df))
+    cerebro.adddata(bt.feeds.PandasData(dataname=df), name="hourly")
     risk_cfg = RiskConfig(dd_lock_pct=-0.2, daily_loss_lock_pct=-0.2, single_asset_cap_pct=5.0, gross_cap_pct=5.0)
     risk = RiskEngineAdapter(cerebro.getbroker(), risk_cfg)
     cerebro.addstrategy(HourlyTrendOverlay, config=cfg, context=context, risk=risk)
