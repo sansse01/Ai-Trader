@@ -141,12 +141,20 @@ def _metrics_from_equity(equity: pd.Series, data: pd.DataFrame) -> Metrics:
     returns = equity.pct_change().fillna(0)
     total_return = float(equity.iloc[-1] - 1)
     periods = len(returns)
-    years = max(periods / 252, 1e-9)
+    bar_seconds = _infer_bar_seconds(data)
+    seconds_per_year = 365.25 * 24 * 60 * 60
+    periods_per_year = max(seconds_per_year / max(bar_seconds, 1e-9), 1e-9)
+    years = max(periods / periods_per_year, 1e-9)
     cagr = float((1 + total_return) ** (1 / years) - 1)
     drawdown = (equity / equity.cummax() - 1).min()
     downside = returns[returns < 0]
-    sharpe = float(returns.mean() / (returns.std(ddof=0) + 1e-9) * np.sqrt(252))
-    sortino = float(returns.mean() / (downside.std(ddof=0) + 1e-9) * np.sqrt(252)) if len(downside) else sharpe
+    annualised_scale = np.sqrt(periods_per_year)
+    sharpe = float(returns.mean() / (returns.std(ddof=0) + 1e-9) * annualised_scale)
+    sortino = (
+        float(returns.mean() / (downside.std(ddof=0) + 1e-9) * annualised_scale)
+        if len(downside)
+        else sharpe
+    )
     calmar = float(cagr / abs(drawdown) if drawdown else 0)
     wins = (returns > 0).sum()
     losses = (returns < 0).sum()
@@ -173,6 +181,16 @@ def _metrics_from_equity(equity: pd.Series, data: pd.DataFrame) -> Metrics:
         timeframe=timeframe,
     )
     return metrics
+
+
+def _infer_bar_seconds(data: pd.DataFrame) -> float:
+    if "Timestamp" not in data:
+        return 60 * 60 * 24
+    diffs = data["Timestamp"].diff().dropna().dt.total_seconds()
+    if diffs.empty:
+        return 60 * 60 * 24
+    median = float(diffs.median())
+    return median if median > 0 else 60 * 60 * 24
 
 
 def _infer_timeframe(data: pd.DataFrame) -> str:
