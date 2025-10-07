@@ -1,0 +1,11 @@
+{
+  "name": "btc_eur_hourly_overlay",
+  "symbol": "BTC/EUR",
+  "bar_interval": "1h",
+  "ema_fast": 8,
+  "ema_slow": 34,
+  "donchian_high": 10,
+  "overlay_notional": 0.2,
+  "max_total_leverage": 1.5,
+  "fees": { "fees_bps_per_side": 5 }
+}
