@@ -28,16 +28,22 @@ class LLMOptimizer:
         data_service: DataService,
         prompt_dir: Path,
         client: Optional[Any] = None,
-        model: str = "gpt-5-thinking",
-        temperature: float = 0.1,
+        model: str = "gpt-5",
+        temperature: Optional[float] = 0.1,
+        reasoning_effort: Optional[str] = None,
+        verbosity: Optional[str] = None,
+        max_output_tokens: Optional[int] = None,
         max_retries: int = 3,
     ) -> None:
         self.registry = registry
         self.data_service = data_service
         self.prompt_dir = prompt_dir
         self.client = client or (OpenAI() if OpenAI else None)
-        self.model = model
+        self.model = model.strip()
         self.temperature = temperature
+        self.reasoning_effort = reasoning_effort
+        self.verbosity = verbosity
+        self.max_output_tokens = max_output_tokens
         self.max_retries = max_retries
         if self.client is None:
             LOGGER.warning("OpenAI client not available; optimizer will require injection during tests.")
@@ -96,13 +102,25 @@ class LLMOptimizer:
     def _call_llm(self, prompt: str) -> str:
         if self.client is None:
             raise RuntimeError("OpenAI client unavailable")
-        response = self.client.chat.completions.create(
-            model=self.model,
-            temperature=self.temperature,
-            response_format={"type": "json_object"},
-            messages=[{"role": "system", "content": prompt}],
-        )
+        request: Dict[str, Any] = {
+            "model": self.model,
+            "response_format": {"type": "json_object"},
+            "messages": [{"role": "system", "content": prompt}],
+        }
+        if self._is_gpt5_model():
+            if self.reasoning_effort:
+                request["reasoning"] = {"effort": self.reasoning_effort}
+            if self.verbosity:
+                request["text"] = {"verbosity": self.verbosity}
+            if self.max_output_tokens:
+                request["max_output_tokens"] = int(self.max_output_tokens)
+        elif self.temperature is not None:
+            request["temperature"] = float(self.temperature)
+        response = self.client.chat.completions.create(**request)
         content = response.choices[0].message.content  # type: ignore[attr-defined]
         if not content:
             raise ValueError("Empty response from LLM")
         return content
+
+    def _is_gpt5_model(self) -> bool:
+        return self.model.lower().startswith("gpt-5")

@@ -34,12 +34,16 @@ def command_optimize(args: argparse.Namespace) -> int:
     data_service = DataService(cache_dir=Path(args.data))
     df = data_service.get_history(args.symbol, args.tf, args.start, args.end)
     summary = data_service.summarize(df)
+    max_tokens = args.max_output_tokens if args.max_output_tokens and args.max_output_tokens > 0 else None
     optimizer = LLMOptimizer(
         registry=registry,
         data_service=data_service,
         prompt_dir=Path(args.prompts),
         model=args.model,
         temperature=args.temperature,
+        reasoning_effort=args.reasoning_effort,
+        verbosity=args.verbosity,
+        max_output_tokens=max_tokens,
     )
     if getattr(args, "mock", None):
         optimizer._call_llm = args.mock  # type: ignore[attr-defined]
@@ -112,12 +116,16 @@ def command_optimize(args: argparse.Namespace) -> int:
 
 def command_compose(args: argparse.Namespace) -> int:
     registry = StrategyRegistry()
+    max_tokens = args.max_output_tokens if args.max_output_tokens and args.max_output_tokens > 0 else None
     optimizer = LLMOptimizer(
         registry=registry,
         data_service=DataService(cache_dir=Path(args.data)),
         prompt_dir=Path(args.prompts),
         model=args.model,
         temperature=args.temperature,
+        reasoning_effort=args.reasoning_effort,
+        verbosity=args.verbosity,
+        max_output_tokens=max_tokens,
     )
     spec_text = Path(args.spec).read_text()
     template = Path(args.prompts) / "compose_template.md"
@@ -206,8 +214,11 @@ def build_parser() -> argparse.ArgumentParser:
     optimize.add_argument("--out", required=True)
     optimize.add_argument("--data", default="data")
     optimize.add_argument("--prompts", default="strategy_builder/prompts")
-    optimize.add_argument("--model", default="gpt-5-thinking")
-    optimize.add_argument("--temperature", type=float, default=0.1)
+    optimize.add_argument("--model", default="gpt-5")
+    optimize.add_argument("--temperature", type=float, default=None)
+    optimize.add_argument("--reasoning-effort", choices=["minimal", "low", "medium", "high"], default="medium")
+    optimize.add_argument("--verbosity", choices=["low", "medium", "high"], default="medium")
+    optimize.add_argument("--max-output-tokens", type=int, default=2048)
     optimize.set_defaults(func=command_optimize)
 
     compose = subparsers.add_parser("compose", help="Compose a strategy from NL spec")
@@ -220,8 +231,11 @@ def build_parser() -> argparse.ArgumentParser:
     compose.add_argument("--data", default="data")
     compose.add_argument("--prompts", default="strategy_builder/prompts")
     compose.add_argument("--catalog", default="strategy_builder/configs/operators_catalog.yaml")
-    compose.add_argument("--model", default="gpt-5-thinking")
-    compose.add_argument("--temperature", type=float, default=0.1)
+    compose.add_argument("--model", default="gpt-5")
+    compose.add_argument("--temperature", type=float, default=None)
+    compose.add_argument("--reasoning-effort", choices=["minimal", "low", "medium", "high"], default="medium")
+    compose.add_argument("--verbosity", choices=["low", "medium", "high"], default="medium")
+    compose.add_argument("--max-output-tokens", type=int, default=2048)
     compose.set_defaults(func=command_compose)
 
     backtest = subparsers.add_parser("backtest", help="Run backtest for params")

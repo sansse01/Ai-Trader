@@ -2,9 +2,11 @@
 import itertools
 import json
 import time
+from collections.abc import Mapping
 from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import ccxt
 import numpy as np
@@ -26,6 +28,89 @@ from strategy_builder.registry import StrategyRegistry
 from strategy_builder.schemas import StrategyGraph
 
 st.set_page_config(page_title="AI Trader Workspace", layout="wide")
+
+GPT5_MODEL_CAPTION = (
+    "**Model presets** — System card → API alias: "
+    "gpt-5-thinking → gpt-5 · "
+    "gpt-5-thinking-mini → gpt-5-mini · "
+    "gpt-5-thinking-nano → gpt-5-nano · "
+    "gpt-5-main → gpt-5-chat-latest. "
+    "The `gpt-5-main-mini` card is not exposed via the API."
+)
+
+
+def is_gpt5_model(model: str) -> bool:
+    """Return True when the API alias targets a GPT-5 family model."""
+
+    return model.strip().lower().startswith("gpt-5")
+
+
+def make_json_safe(value: Any) -> Any:
+    """Recursively convert values into JSON-serialisable primitives."""
+
+    if isinstance(value, Mapping):
+        return {key: make_json_safe(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [make_json_safe(item) for item in value]
+    if hasattr(value, "dict") and callable(getattr(value, "dict")):
+        try:
+            return make_json_safe(value.dict())
+        except TypeError:
+            pass
+    if hasattr(value, "model_dump") and callable(getattr(value, "model_dump")):
+        return make_json_safe(value.model_dump())
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    if isinstance(value, np.datetime64):
+        return pd.to_datetime(value).isoformat()
+    return value
+
+
+def render_llm_controls(prefix: str) -> Tuple[str, Optional[float], Optional[str], Optional[str], Optional[int]]:
+    """Collect shared LLM configuration controls for GPT-5 and legacy models."""
+
+    model = st.text_input("Model", value="gpt-5", key=f"{prefix}_model").strip()
+    st.caption(GPT5_MODEL_CAPTION)
+
+    if is_gpt5_model(model):
+        reasoning = st.selectbox(
+            "Reasoning effort",
+            ["minimal", "low", "medium", "high"],
+            index=2,
+            key=f"{prefix}_reasoning",
+        )
+        verbosity = st.selectbox(
+            "Response verbosity",
+            ["low", "medium", "high"],
+            index=1,
+            key=f"{prefix}_verbosity",
+        )
+        max_tokens_raw = st.number_input(
+            "Max output tokens (0 uses the API default)",
+            min_value=0,
+            max_value=8192,
+            value=2048,
+            step=128,
+            key=f"{prefix}_max_tokens",
+        )
+        max_tokens = int(max_tokens_raw) or None
+        return model, None, reasoning, verbosity, max_tokens
+
+    temperature = st.slider(
+        "Temperature",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.1,
+        step=0.05,
+        key=f"{prefix}_temperature",
+    )
+    return model, float(temperature), None, None, None
 
 # -----------------------------
 # Kraken symbol normalization (BTC↔XBT) + robust fetch
@@ -1466,8 +1551,7 @@ def render_parameter_generator():
         limit_per_page = st.number_input("Rows per page", min_value=100, max_value=1000, value=720, step=10, key="builder_limit")
         max_pages = st.number_input("Max fetch pages", min_value=1, max_value=120, value=20, step=1, key="builder_pages")
         st.subheader("LLM configuration")
-        model = st.text_input("Model", value="gpt-5-thinking", key="builder_model")
-        temperature = st.slider("Temperature", 0.0, 1.0, 0.1, 0.05, key="builder_temperature")
+        model, temperature, reasoning_effort, response_verbosity, max_output_tokens = render_llm_controls("builder")
         proposal_count = st.number_input("Proposals", min_value=1, max_value=16, value=8, step=1, key="builder_proposals")
         prompt_dir = st.text_input(
             "Prompt directory",
@@ -1539,7 +1623,10 @@ def render_parameter_generator():
                     prompt_dir=prompt_path,
                     client=client,
                     model=model,
-                    temperature=float(temperature),
+                    temperature=temperature,
+                    reasoning_effort=reasoning_effort,
+                    verbosity=response_verbosity,
+                    max_output_tokens=max_output_tokens,
                 )
 
                 response = optimizer.optimize(
@@ -1620,7 +1707,7 @@ def render_parameter_generator():
                     card["champion_error"] = str(exc)
 
                 st.session_state["builder_results"] = {
-                    "card": card,
+                    "card": make_json_safe(card),
                     "rows": table_rows,
                     "symbol": symbol.strip(),
                     "timeframe": timeframe,
@@ -1649,9 +1736,9 @@ def render_parameter_generator():
     champion = card.get("champion")
     if champion:
         st.markdown("### Champion proposal")
-        st.json(champion)
+        st.json(make_json_safe(champion))
 
-    card_bytes = json.dumps(card, indent=2).encode("utf-8")
+    card_bytes = json.dumps(make_json_safe(card), indent=2).encode("utf-8")
     file_name = (
         f"strategy_card_{card['strategy']}_{card['timeframe']}_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}.json"
     )
@@ -1683,8 +1770,7 @@ def render_strategy_generator():
             value=str(Path("strategy_builder/configs/operators_catalog.yaml").resolve()),
             key="compose_catalog",
         )
-        model = st.text_input("Model", value="gpt-5-thinking", key="compose_model")
-        temperature = st.slider("Temperature", 0.0, 1.0, 0.1, 0.05, key="compose_temperature")
+        model, temperature, reasoning_effort, response_verbosity, max_output_tokens = render_llm_controls("compose")
         symbol = st.text_input("Validation symbol", value="BTC/EUR", key="compose_symbol")
         timeframe = st.selectbox("Validation timeframe", timeframe_options, index=timeframe_options.index("1h"), key="compose_timeframe")
         since_str = st.text_input("Since (UTC ISO8601)", value="2022-01-01T00:00:00Z", key="compose_since")
@@ -1740,7 +1826,10 @@ uses ATR based stops and trails, and reduces position size during sideways regim
                     prompt_dir=prompt_path,
                     client=client,
                     model=model,
-                    temperature=float(temperature),
+                    temperature=temperature,
+                    reasoning_effort=reasoning_effort,
+                    verbosity=response_verbosity,
+                    max_output_tokens=max_output_tokens,
                 )
 
                 template = (prompt_path / "compose_template.md").read_text()
