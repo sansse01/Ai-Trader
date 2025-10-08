@@ -171,29 +171,80 @@ def fetch_ohlcv(
     page_budget = max(min(approx_pages + 5, 2400), 4)
 
     tolerance_ms = max(timeframe_ms, 60_000)
-    params = {"paginate": True, "paginationCalls": page_budget}
-    all_rows: list[list[float]] = []
-    pages = 0
-    manual_attempted = False
-
     rate_limit_exc = getattr(module, "RateLimitExceeded", Exception)
 
-    def _manual_fetch() -> tuple[list[list[float]], int]:
-        rows: list[list[float]] = []
-        seen_ts: set[int] = set()
-        cursor = since_ms
-        calls = 0
+    all_rows: list[list[float]] = []
+    seen_ts: set[int] = set()
+    min_ts: Optional[int] = None
+    max_ts: Optional[int] = None
+    pages_used = 0
+    pages_hint = 0
+
+    def _update_bounds(ts: int) -> None:
+        nonlocal min_ts, max_ts
+        if min_ts is None or ts < min_ts:
+            min_ts = ts
+        if max_ts is None or ts > max_ts:
+            max_ts = ts
+
+    def _ingest(rows: list[list[float]]) -> bool:
+        added = False
+        for row in rows:
+            if not row:
+                continue
+            ts = int(row[0])
+            if ts < since_ms or ts > target_end_ms + tolerance_ms:
+                continue
+            if ts in seen_ts:
+                continue
+            seen_ts.add(ts)
+            all_rows.append(row)
+            _update_bounds(ts)
+            added = True
+        return added
+
+    def _has_target_coverage() -> bool:
+        if min_ts is None or max_ts is None:
+            return False
+        coverage_ms = max_ts - min_ts
+        return desired_span_ms <= 0 or coverage_ms + tolerance_ms >= desired_span_ms
+
+    params = {"paginate": True, "paginationCalls": page_budget}
+    try:
+        raw_rows = ex.fetch_ohlcv(
+            sym,
+            timeframe,
+            since=since_ms,
+            limit=limit_per_page,
+            params=params,
+        )
+    except TypeError:
+        raw_rows = None
+    except Exception:
+        raw_rows = None
+    else:
+        pages_used += 1
+        rows_list = list(raw_rows or [])
+        if rows_list:
+            _ingest(rows_list)
+            pages_hint = min(page_budget, max(1, math.ceil(len(rows_list) / max(limit_per_page, 1))))
+        else:
+            pages_hint = 1
+
+    def _forward_fill(start_cursor: int, pages_so_far: int) -> int:
+        cursor = start_cursor
         idle = 0
         max_idle = 3
-        while calls < page_budget and cursor <= target_end_ms + tolerance_ms:
+        while pages_so_far < page_budget and cursor <= target_end_ms + tolerance_ms:
             try:
-                ohlcv_chunk = ex.fetch_ohlcv(sym, timeframe, since=int(cursor), limit=limit_per_page)
+                chunk = ex.fetch_ohlcv(sym, timeframe, since=int(cursor), limit=limit_per_page)
             except rate_limit_exc:
                 time.sleep(1.25)
                 continue
             except Exception:
                 break
-            if not ohlcv_chunk:
+            pages_so_far += 1
+            if not chunk:
                 idle += 1
                 if idle >= max_idle:
                     cursor += max(chunk_span_ms, timeframe_ms)
@@ -204,78 +255,112 @@ def fetch_ohlcv(
                 continue
 
             idle = 0
-            calls += 1
-            filtered: list[list[float]] = []
             last_ts = cursor
-            for row in ohlcv_chunk:
+            added = False
+            for row in chunk:
+                if not row:
+                    continue
                 ts = int(row[0])
                 if ts < since_ms or ts > target_end_ms + tolerance_ms:
                     continue
                 if ts in seen_ts:
                     continue
                 seen_ts.add(ts)
-                filtered.append(row)
+                all_rows.append(row)
+                _update_bounds(ts)
+                added = True
                 if ts > last_ts:
                     last_ts = ts
 
-            if filtered:
-                rows.extend(filtered)
-                advance = last_ts + timeframe_ms
-                if advance <= cursor:
-                    advance = cursor + timeframe_ms
-                cursor = advance
+            time.sleep(0.2)
+
+            if added:
+                cursor = last_ts + timeframe_ms
             else:
                 cursor += timeframe_ms
 
+            if _has_target_coverage():
+                break
+        return pages_so_far
+
+    def _backfill(pages_so_far: int) -> int:
+        if min_ts is None:
+            return pages_so_far
+
+        cursor = min_ts - chunk_span_ms
+        idle = 0
+        max_idle = 3
+        while pages_so_far < page_budget and cursor + tolerance_ms >= since_ms:
+            raw_cursor = cursor
+            cursor = max(cursor, 0)
+            try:
+                chunk = ex.fetch_ohlcv(sym, timeframe, since=int(cursor), limit=limit_per_page)
+            except rate_limit_exc:
+                time.sleep(1.25)
+                continue
+            except Exception:
+                break
+
+            pages_so_far += 1
+            if not chunk:
+                idle += 1
+                if idle >= max_idle:
+                    if raw_cursor <= 0:
+                        break
+                    cursor = raw_cursor - max(chunk_span_ms, timeframe_ms)
+                    idle = 0
+                else:
+                    cursor = raw_cursor - timeframe_ms
+                time.sleep(0.2)
+                continue
+
+            idle = 0
+            added = False
+            oldest = min_ts
+            for row in chunk:
+                if not row:
+                    continue
+                ts = int(row[0])
+                if ts < since_ms or ts > target_end_ms + tolerance_ms:
+                    continue
+                if ts in seen_ts:
+                    continue
+                seen_ts.add(ts)
+                all_rows.append(row)
+                _update_bounds(ts)
+                added = True
+                if oldest is None or ts < oldest:
+                    oldest = ts
+
             time.sleep(0.2)
 
-            if rows:
-                coverage_ms = rows[-1][0] - rows[0][0]
-                if desired_span_ms <= 0 or coverage_ms + tolerance_ms >= desired_span_ms:
+            if added:
+                current_min = min_ts if min_ts is not None else oldest
+                if current_min is None:
+                    cursor -= chunk_span_ms
+                else:
+                    cursor = current_min - chunk_span_ms
+            else:
+                if raw_cursor <= 0:
                     break
-        return rows, calls
+                cursor = raw_cursor - max(chunk_span_ms, timeframe_ms)
 
-    manual_calls = 0
+            if _has_target_coverage():
+                break
+        return pages_so_far
 
-    try:
-        raw_rows = ex.fetch_ohlcv(
-            sym,
-            timeframe,
-            since=since_ms,
-            limit=limit_per_page,
-            params=params,
-        )
-        all_rows = list(raw_rows or [])
-        if all_rows:
-            pages = min(page_budget, max(1, math.ceil(len(all_rows) / max(limit_per_page, 1))))
-    except TypeError:
-        all_rows, manual_calls = _manual_fetch()
-        pages = manual_calls or pages
-        manual_attempted = True
-    except Exception:
-        all_rows, manual_calls = _manual_fetch()
-        pages = manual_calls or pages
-        manual_attempted = True
+    if not _has_target_coverage():
+        start_cursor = since_ms if max_ts is None else max(max_ts + timeframe_ms, since_ms)
+        pages_used = _forward_fill(start_cursor, pages_used)
 
-    if all_rows and not manual_attempted:
-        ts_values = [int(row[0]) for row in all_rows if row]
-        coverage_ms = (max(ts_values) - min(ts_values)) if ts_values else 0
-        coverage_met = desired_span_ms <= 0 or coverage_ms + tolerance_ms >= desired_span_ms
-        if not coverage_met:
-            manual_rows, manual_calls = _manual_fetch()
-            manual_attempted = True
-            if manual_rows:
-                all_rows.extend(manual_rows)
-            if manual_calls:
-                pages = max(pages, manual_calls)
+    if not _has_target_coverage() and min_ts is not None and min_ts > since_ms + tolerance_ms:
+        pages_used = _backfill(pages_used)
 
-    if (not all_rows) and not manual_attempted:
-        manual_rows, manual_calls = _manual_fetch()
-        manual_attempted = True
-        if manual_rows:
-            all_rows = manual_rows
-        if manual_calls:
-            pages = manual_calls
+    if not _has_target_coverage():
+        start_cursor = since_ms if max_ts is None else max(max_ts + timeframe_ms, since_ms)
+        pages_used = _forward_fill(start_cursor, pages_used)
+
+    pages = max(pages_hint, pages_used)
 
     if not all_rows:
         empty = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
@@ -291,19 +376,9 @@ def fetch_ohlcv(
             reached_target=False,
         )
 
-    filtered_rows: list[list[float]] = []
-    seen_ts: set[int] = set()
-    for row in all_rows:
-        ts = int(row[0])
-        if ts < since_ms or ts > target_end_ms + tolerance_ms:
-            continue
-        if ts in seen_ts:
-            continue
-        seen_ts.add(ts)
-        filtered_rows.append(row)
+    all_rows.sort(key=lambda item: item[0])
 
-    filtered_rows.sort(key=lambda item: item[0])
-    df = pd.DataFrame(filtered_rows, columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"])
+    df = pd.DataFrame(all_rows, columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"])
     df["Timestamp"] = pd.to_datetime(df["Timestamp"], unit="ms", utc=True)
     df = df.drop_duplicates(subset=["Timestamp"]).set_index("Timestamp").sort_index()
     requested_start = pd.to_datetime(since_ms, unit="ms", utc=True)
