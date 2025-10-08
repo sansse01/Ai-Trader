@@ -207,21 +207,6 @@ def fetch_ohlcv(
         except Exception:
             return None
 
-    def _fetch_chunk_with_params(cursor: int, extra_params: dict[str, object]) -> Optional[list[list[float]]]:
-        try:
-            return ex.fetch_ohlcv(
-                sym,
-                timeframe,
-                since=int(cursor),
-                limit=limit_per_page,
-                params=extra_params,
-            )
-        except rate_limit_exc:
-            time.sleep(1.25)
-            return None
-        except Exception:
-            return None
-
     def _ingest_chunk(rows: Optional[list[list[float]]]) -> tuple[bool, Optional[int]]:
         if not rows:
             return False, None
@@ -243,19 +228,15 @@ def fetch_ohlcv(
                 newest = ts
         return added, newest
 
-    params = {"paginate": True, "paginationCalls": page_budget}
-
-    raw_rows = _fetch_chunk_with_params(since_ms, params)
-    if raw_rows is not None:
+    first_chunk = _fetch_chunk(since_ms)
+    pages_hint = 0
+    if first_chunk is not None:
         pages_used += 1
-        rows_list = list(raw_rows or [])
-        if rows_list:
-            _ingest_chunk(rows_list)
-            pages_hint = min(page_budget, max(1, math.ceil(len(rows_list) / max(limit_per_page, 1))))
-        else:
+        added, newest = _ingest_chunk(first_chunk)
+        if added and newest is not None:
             pages_hint = 1
-    else:
-        pages_hint = 0
+        elif first_chunk:
+            pages_hint = 1
 
     def _forward_paginate(start_cursor: int, pages_so_far: int) -> int:
         cursor = start_cursor
