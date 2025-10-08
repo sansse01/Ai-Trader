@@ -6,7 +6,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Optional
 
-import ccxt
+try:  # pragma: no cover - optional dependency
+    import ccxt  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    ccxt = None  # type: ignore
 import pandas as pd
 
 
@@ -59,10 +62,30 @@ def window_to_timedelta(window_value: int, window_unit: str) -> timedelta:
     return timedelta(days=window_value)
 
 
+class MissingCcxtError(RuntimeError):
+    """Raised when a ccxt-dependent feature is used without the library installed."""
+
+
+def _ensure_ccxt() -> "ccxt":
+    if ccxt is None:
+        raise MissingCcxtError("ccxt is required for live exchange operations. Install it with `pip install ccxt`.")
+    return ccxt
+
+
+def _parse8601(value: str) -> Optional[int]:
+    try:
+        ts = pd.to_datetime(value, utc=True)
+    except Exception:
+        return None
+    if pd.isna(ts):
+        return None
+    return int(ts.timestamp() * 1000)
+
+
 def resolve_since(window_value: int, window_unit: str, override: str = "") -> tuple[int, datetime, timedelta]:
     override_clean = (override or "").strip()
     if override_clean:
-        parsed = ccxt.kraken().parse8601(override_clean)
+        parsed = _parse8601(override_clean)
         if parsed is None:
             raise ValueError("Invalid 'Since' value. Use ISO8601 like 2022-01-01T00:00:00Z")
         dt = datetime.fromtimestamp(parsed / 1000.0, tz=UTC)
@@ -94,6 +117,25 @@ def normalize_symbol(exchange: "ccxt.Exchange", symbol: str) -> str:
     return symbol
 
 
+def _fallback_parse_timeframe(timeframe: str) -> int:
+    unit = timeframe[-1:].lower()
+    try:
+        value = float(timeframe[:-1] or 1)
+    except ValueError:
+        return 60
+    multipliers = {
+        "s": 1,
+        "m": 60,
+        "h": 60 * 60,
+        "d": 60 * 60 * 24,
+        "w": 60 * 60 * 24 * 7,
+    }
+    seconds = multipliers.get(unit)
+    if seconds is None:
+        return 60
+    return int(max(value * seconds, 1))
+
+
 def fetch_ohlcv(
     symbol: str,
     timeframe: str,
@@ -101,12 +143,21 @@ def fetch_ohlcv(
     target_end_ms: Optional[int] = None,
     limit_per_page: int = 720,
 ) -> OHLCVFetchResult:
-    ex = ccxt.kraken()
+    module = _ensure_ccxt()
+    if not hasattr(module, "kraken"):
+        raise MissingCcxtError("ccxt.kraken() is unavailable; ensure the exchange is supported by your ccxt build.")
+
+    ex = module.kraken()
     sym = normalize_symbol(ex, symbol)
-    try:
-        timeframe_seconds = ccxt.Exchange.parse_timeframe(timeframe)
-    except Exception:
-        timeframe_seconds = 60
+    timeframe_seconds = None
+    exchange_cls = getattr(module, "Exchange", None)
+    if exchange_cls is not None and hasattr(exchange_cls, "parse_timeframe"):
+        try:
+            timeframe_seconds = exchange_cls.parse_timeframe(timeframe)
+        except Exception:
+            timeframe_seconds = None
+    if timeframe_seconds is None:
+        timeframe_seconds = _fallback_parse_timeframe(timeframe)
     timeframe_ms = max(int(timeframe_seconds * 1000), 1)
 
     if target_end_ms is None:
@@ -125,6 +176,8 @@ def fetch_ohlcv(
     pages = 0
     manual_attempted = False
 
+    rate_limit_exc = getattr(module, "RateLimitExceeded", Exception)
+
     def _manual_fetch() -> tuple[list[list[float]], int]:
         rows: list[list[float]] = []
         seen_ts: set[int] = set()
@@ -135,7 +188,7 @@ def fetch_ohlcv(
         while calls < page_budget and cursor <= target_end_ms + tolerance_ms:
             try:
                 ohlcv_chunk = ex.fetch_ohlcv(sym, timeframe, since=int(cursor), limit=limit_per_page)
-            except ccxt.RateLimitExceeded:
+            except rate_limit_exc:
                 time.sleep(1.25)
                 continue
             except Exception:

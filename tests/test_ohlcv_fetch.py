@@ -1,9 +1,19 @@
 from __future__ import annotations
 
+import types
+
 import pandas as pd
 import pytest
 
 import ohlcv_fetcher as fetcher
+
+
+class _FakeExchangeNamespace:
+    def __init__(self, timeframe_seconds: int) -> None:
+        self.timeframe_seconds = timeframe_seconds
+
+    def parse_timeframe(self, timeframe: str) -> int:
+        return self.timeframe_seconds
 
 
 class FakeKrakenExchange:
@@ -47,7 +57,12 @@ def test_fetch_ohlcv_falls_back_to_manual_pagination(monkeypatch):
     end_ms = start_ms + hours * frame_ms
 
     fake_exchange = FakeKrakenExchange(start_ms=start_ms, rows=hours, frame_ms=frame_ms)
-    monkeypatch.setattr(fetcher.ccxt, "kraken", lambda: fake_exchange)
+    fake_module = types.SimpleNamespace(
+        kraken=lambda: fake_exchange,
+        Exchange=_FakeExchangeNamespace(timeframe_seconds=frame_ms // 1000),
+        RateLimitExceeded=Exception,
+    )
+    monkeypatch.setattr(fetcher, "ccxt", fake_module)
 
     result = fetcher.fetch_ohlcv(
         symbol="BTC/EUR",
