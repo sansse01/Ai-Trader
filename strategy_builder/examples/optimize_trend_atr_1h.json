@@ -1,0 +1,18 @@
+{
+  "strategy": "trend_atr",
+  "timeframe": "1h",
+  "symbol": "BTC/EUR",
+  "start": "2024-01-01",
+  "end": "2024-03-01",
+  "bounds": {
+    "ema_fast": [5, 40],
+    "ema_slow": [80, 200],
+    "donchian": [20, 80],
+    "stop_atr": [1.5, 3.5],
+    "trail_atr": [2.0, 5.0]
+  },
+  "constraints": {
+    "max_trades": 120,
+    "min_cagr": 0.25
+  }
+}

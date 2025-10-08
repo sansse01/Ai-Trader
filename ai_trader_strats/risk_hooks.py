@@ -30,7 +30,7 @@ class RiskEngineAdapter:
         self._broker = broker
         self._cfg = risk_cfg
         initial_equity = float(getattr(self._broker, "getvalue", lambda: 0.0)())
-        today = datetime.utcnow().date()
+        today = datetime.now(timezone.utc).date()
         self._state = _RiskState(
             equity_hwm=initial_equity,
             day_start_equity=initial_equity,
@@ -137,7 +137,7 @@ class RiskEngineAdapter:
     def _current_day(self) -> date:
         timestamp = self._state.last_timestamp
         if timestamp is None:
-            return datetime.utcnow().date()
+            return datetime.now(timezone.utc).date()
         return timestamp.astimezone(timezone.utc).date()
 
     # ------------------------------------------------------------------
