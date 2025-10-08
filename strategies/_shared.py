@@ -38,6 +38,10 @@ def make_signal_backtest_builder(
         contract_size = float(merged_params.get("contract_size", 0.001))
 
         class SignalStrategy(Strategy):
+            def init(self):
+                """Backtesting.py hook — no pre-computation required for signal playback."""
+                return None
+
             def _position_size(self, price: float) -> float:
                 if sizing_mode.startswith("Whole"):
                     cash = float(self.equity)

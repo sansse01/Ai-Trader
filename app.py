@@ -1,6 +1,7 @@
 
 import itertools
 import json
+import math
 import time
 import uuid
 from collections import OrderedDict
@@ -81,6 +82,10 @@ class OHLCVFetchResult:
     pages: int
     limit_per_page: int
     max_pages: int
+    requested_start: Optional[pd.Timestamp] = None
+    requested_end: Optional[pd.Timestamp] = None
+    target_coverage: Optional[pd.Timedelta] = None
+    reached_target: bool = False
 
     @property
     def rows(self) -> int:
@@ -106,10 +111,23 @@ class OHLCVFetchResult:
 
     @property
     def truncated(self) -> bool:
+        if self.reached_target:
+            return False
         return self.pages >= self.max_pages
 
 
-def resolve_since(window_value: int, window_unit: str, override: str = "") -> tuple[int, datetime]:
+def window_to_timedelta(window_value: int, window_unit: str) -> timedelta:
+    unit = window_unit.lower()
+    if unit.startswith("day"):
+        return timedelta(days=window_value)
+    if unit.startswith("month"):
+        return timedelta(days=30 * window_value)
+    if unit.startswith("year"):
+        return timedelta(days=365 * window_value)
+    return timedelta(days=window_value)
+
+
+def resolve_since(window_value: int, window_unit: str, override: str = "") -> tuple[int, datetime, timedelta]:
     """Resolve the oldest timestamp to request based on a window or override."""
 
     override_clean = (override or "").strip()
@@ -118,22 +136,15 @@ def resolve_since(window_value: int, window_unit: str, override: str = "") -> tu
         if parsed is None:
             raise ValueError("Invalid 'Since' value. Use ISO8601 like 2022-01-01T00:00:00Z")
         dt = datetime.fromtimestamp(parsed / 1000.0, tz=UTC)
-        return parsed, dt
+        delta = window_to_timedelta(window_value, window_unit)
+        return parsed, dt, delta
 
-    unit = window_unit.lower()
-    if unit.startswith("day"):
-        delta = timedelta(days=window_value)
-    elif unit.startswith("month"):
-        delta = timedelta(days=30 * window_value)
-    elif unit.startswith("year"):
-        delta = timedelta(days=365 * window_value)
-    else:
-        delta = timedelta(days=window_value)
+    delta = window_to_timedelta(window_value, window_unit)
 
     now = datetime.now(UTC)
     start_dt = now - delta
     since_ms = int(start_dt.timestamp() * 1000)
-    return since_ms, start_dt
+    return since_ms, start_dt, delta
 
 
 def _controls_from_schema(model: Any) -> tuple[OrderedDict[str, Dict[str, Any]], Dict[str, Any]]:
@@ -385,15 +396,33 @@ def fetch_ohlcv(
     symbol: str,
     timeframe: str,
     since_ms: int,
+    target_end_ms: Optional[int] = None,
     limit_per_page: int = 720,
-    max_pages: int = 60,
-    query_batches: int = 1,
 ) -> OHLCVFetchResult:
     ex = ccxt.kraken()
     sym = normalize_symbol(ex, symbol)
-    all_rows, cursor, pages = [], since_ms, 0
-    page_cap = max_pages * max(1, int(query_batches))
-    while True:
+    try:
+        timeframe_seconds = ccxt.Exchange.parse_timeframe(timeframe)
+    except Exception:
+        timeframe_seconds = 60
+    timeframe_ms = max(int(timeframe_seconds * 1000), 1)
+
+    if target_end_ms is None:
+        target_end_ms = int(datetime.now(UTC).timestamp() * 1000)
+    if target_end_ms <= since_ms:
+        target_end_ms = since_ms + timeframe_ms
+
+    desired_span_ms = max(0, target_end_ms - since_ms)
+    approx_bars = math.ceil(desired_span_ms / timeframe_ms) if timeframe_ms else 0
+    approx_pages = math.ceil(approx_bars / limit_per_page) if approx_bars else 1
+    page_budget = max(min(approx_pages + 5, 2400), 4)
+
+    tolerance_ms = max(timeframe_ms, 60_000)
+    all_rows: list[list[float]] = []
+    cursor = since_ms
+    pages = 0
+
+    while pages < page_budget:
         try:
             ohlcv = ex.fetch_ohlcv(sym, timeframe, since=cursor, limit=limit_per_page)
         except ccxt.RateLimitExceeded:
@@ -403,10 +432,14 @@ def fetch_ohlcv(
         if not ohlcv:
             break
         all_rows.extend(ohlcv)
-        cursor = ohlcv[-1][0] + 1
+        last_ts = ohlcv[-1][0]
         pages += 1
-        if pages >= page_cap or len(ohlcv) < 2:
+        if last_ts >= target_end_ms - tolerance_ms:
             break
+        if len(ohlcv) < limit_per_page:
+            if last_ts >= target_end_ms - tolerance_ms:
+                break
+        cursor = last_ts + timeframe_ms
         time.sleep(0.2)
     if not all_rows:
         empty = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
@@ -415,16 +448,30 @@ def fetch_ohlcv(
             empty,
             pages=pages,
             limit_per_page=limit_per_page,
-            max_pages=page_cap,
+            max_pages=page_budget,
+            requested_start=pd.to_datetime(since_ms, unit="ms", utc=True),
+            requested_end=pd.to_datetime(target_end_ms, unit="ms", utc=True),
+            target_coverage=pd.to_timedelta(desired_span_ms, unit="ms"),
+            reached_target=False,
         )
     df = pd.DataFrame(all_rows, columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"])
     df["Timestamp"] = pd.to_datetime(df["Timestamp"], unit="ms", utc=True)
     df = df.drop_duplicates(subset=["Timestamp"]).set_index("Timestamp").sort_index()
+    requested_start = pd.to_datetime(since_ms, unit="ms", utc=True)
+    requested_end = pd.to_datetime(target_end_ms, unit="ms", utc=True)
+    target_coverage = pd.to_timedelta(desired_span_ms, unit="ms")
+    coverage = df.index.max() - df.index.min() if not df.empty else pd.Timedelta(0)
+    tolerance = pd.to_timedelta(tolerance_ms, unit="ms")
+    reached_target = desired_span_ms <= 0 or coverage + tolerance >= target_coverage
     return OHLCVFetchResult(
         df,
         pages=pages,
         limit_per_page=limit_per_page,
-        max_pages=page_cap,
+        max_pages=page_budget,
+        requested_start=requested_start,
+        requested_end=requested_end,
+        target_coverage=target_coverage,
+        reached_target=reached_target,
     )
 
 def plot_chart(
@@ -1218,34 +1265,6 @@ def render_trading_console():
             since_ms = None
             st.error("Invalid 'Since' string (e.g. 2023-01-01T00:00:00Z)")
 
-        rows_per_page = st.number_input(
-            "Rows per page",
-            min_value=100,
-            max_value=1000,
-            value=st.session_state.get("console_limit", 720),
-            step=10,
-            key="console_limit",
-            help="Maximum candles Kraken returns per API call.",
-        )
-        max_pages = st.number_input(
-            "Max fetch pages",
-            min_value=1,
-            max_value=240,
-            value=st.session_state.get("console_pages", 60),
-            step=1,
-            key="console_pages",
-            help="Upper bound for sequential Kraken requests per symbol.",
-        )
-        query_batches = st.number_input(
-            "Query batches",
-            min_value=1,
-            max_value=10,
-            value=st.session_state.get("console_batches", 1),
-            step=1,
-            key="console_batches",
-            help="Multiply the page allowance to gather longer histories when limits are tight.",
-        )
-
         st.header("Strategy")
         strategy_index = strategy_keys.index(selected_strategy_key)
         selected_strategy_key = st.selectbox(
@@ -1537,6 +1556,8 @@ def render_trading_console():
         st.stop()
 
     requested_start = datetime.fromtimestamp(since_ms / 1000.0, tz=UTC)
+    target_end_dt = datetime.now(UTC)
+    target_end_ms = int(target_end_dt.timestamp() * 1000)
 
     with st.spinner("Fetching data..."):
         symbol_datasets: Dict[str, Dict[str, pd.DataFrame]] = {}
@@ -1550,9 +1571,7 @@ def render_trading_console():
                     entry,
                     timeframe,
                     since_ms,
-                    limit_per_page=int(rows_per_page),
-                    max_pages=int(max_pages),
-                    query_batches=int(query_batches),
+                    target_end_ms=target_end_ms,
                 )
                 df_entry = result.data
                 if df_entry.empty:
@@ -1585,29 +1604,30 @@ def render_trading_console():
     st.subheader("Data Preview")
     if primary_result:
         coverage = primary_result.coverage
-        coverage_text = f" | Coverage: {coverage}" if coverage else ""
-        truncation = " (API window capped)" if primary_result.truncated else ""
+        target_span = primary_result.target_coverage
+        coverage_text = ""
+        if coverage is not None and coverage > pd.Timedelta(0):
+            coverage_text = f" | Coverage: {coverage}"
+        target_text = ""
+        if target_span is not None and target_span > pd.Timedelta(0):
+            target_text = f" | Requested: {target_span}"
+        truncation = " (API budget reached)" if primary_result.truncated else ""
         st.caption(
             f"Bars: {primary_result.rows:,} | Range: {primary_result.start} → {primary_result.end}"
-            f" | Timezone: {df.index.tz}{truncation}{coverage_text}"
+            f" | Timezone: {df.index.tz}{truncation}{coverage_text}{target_text}"
             f" | Requests: {primary_result.pages}/{primary_result.max_pages}"
         )
-        if primary_result.truncated:
+        if (
+            not primary_result.reached_target
+            and target_span is not None
+            and coverage is not None
+        ):
             st.warning(
-                "Reached the configured page limit while fetching data. Increase 'Max fetch pages' to cover the full window.",
-                icon="⚠️",
+                "Exchange history is shorter than requested."
+                f" Received ≈{coverage} vs desired ≈{target_span}."
+                " Additional automatic requests have been exhausted; consider reducing the window or timeframe.",
+                icon="ℹ️",
             )
-        if coverage:
-            desired_delta = datetime.now(UTC) - requested_start
-            desired_span = pd.to_timedelta(desired_delta)
-            tolerance = pd.Timedelta(minutes=1)
-            if desired_span > coverage + tolerance:
-                st.warning(
-                    f"Exchange data is shorter than the requested window (~{desired_span}). Fetched coverage is ~{coverage}."
-                    " Increase 'Max fetch pages', raise 'Query batches', or reduce the window/timeframe to stay within"
-                    " Kraken's limits.",
-                    icon="ℹ️",
-                )
     else:
         st.caption(f"Bars: {len(df):,}  |  Range: {df.index.min()} → {df.index.max()}  |  Timezone: {df.index.tz}")
     st.dataframe(df.tail(preview_rows))
@@ -1907,36 +1927,10 @@ def render_parameter_generator():
             "Override start (optional, UTC ISO8601)", value="", key="builder_since_override"
         )
         try:
-            _, computed_start = resolve_since(int(window_value), window_unit, since_override)
+            _, computed_start, _ = resolve_since(int(window_value), window_unit, since_override)
             st.caption(f"Approximate start: {computed_start.isoformat()} UTC")
         except ValueError:
             st.caption("Provide a valid ISO8601 override or leave blank to use the window.")
-        limit_per_page = st.number_input(
-            "Rows per page",
-            min_value=100,
-            max_value=1000,
-            value=720,
-            step=10,
-            key="builder_limit",
-        )
-        max_pages = st.number_input(
-            "Max fetch pages",
-            min_value=1,
-            max_value=240,
-            value=20,
-            step=1,
-            key="builder_pages",
-            help="Maximum Kraken API pages to request per batch (each page ≈ limit rows).",
-        )
-        query_batches = st.number_input(
-            "Query batches",
-            min_value=1,
-            max_value=10,
-            value=1,
-            step=1,
-            key="builder_batches",
-            help="Multiply the page budget when the requested window spans more than one API sweep.",
-        )
         st.subheader("LLM configuration")
         model, temperature, reasoning_effort, response_verbosity, max_output_tokens = render_llm_controls("builder")
         proposal_count = st.number_input("Proposals", min_value=1, max_value=16, value=8, step=1, key="builder_proposals")
@@ -1968,18 +1962,21 @@ def render_parameter_generator():
                 raise ValueError("Symbol is required for data fetch.")
 
             try:
-                since_ms, since_dt = resolve_since(int(window_value), window_unit, since_override)
+                since_ms, since_dt, window_delta = resolve_since(int(window_value), window_unit, since_override)
             except ValueError as exc:  # pragma: no cover - user input validation
                 raise ValueError(str(exc)) from exc
 
             with st.spinner("Fetching data and querying the LLM..."):
+                target_end_dt = since_dt + window_delta
+                now_dt = datetime.now(UTC)
+                if target_end_dt > now_dt:
+                    target_end_dt = now_dt
+                target_end_ms = int(target_end_dt.timestamp() * 1000)
                 fetch_result = fetch_ohlcv(
                     symbol.strip(),
                     timeframe,
                     since_ms,
-                    limit_per_page=int(limit_per_page),
-                    max_pages=int(max_pages),
-                    query_batches=int(query_batches),
+                    target_end_ms=target_end_ms,
                 )
 
                 if fetch_result.data.empty:
@@ -1987,6 +1984,7 @@ def render_parameter_generator():
 
                 st.session_state["builder_last_fetch"] = fetch_result
                 st.session_state["builder_last_start"] = since_dt
+                st.session_state["builder_last_end"] = target_end_dt
                 st.session_state["builder_last_symbol"] = symbol.strip()
                 st.session_state["builder_last_timeframe"] = timeframe
 
@@ -2111,34 +2109,25 @@ def render_parameter_generator():
 
     fetch_info = st.session_state.get("builder_last_fetch")
     if isinstance(fetch_info, OHLCVFetchResult):
-        coverage = fetch_info.coverage
-        coverage_text = f" Coverage: {coverage}." if coverage else ""
         symbol_hint = st.session_state.get("builder_last_symbol", symbol)
         timeframe_hint = st.session_state.get("builder_last_timeframe", timeframe)
-        requested_start = st.session_state.get("builder_last_start")
-        coverage_shortfall = False
-        coverage_hint = ""
-        if coverage and isinstance(requested_start, datetime):
-            desired_span = pd.to_timedelta(datetime.now(UTC) - requested_start)
-            tolerance = pd.Timedelta(minutes=1)
-            if desired_span > coverage + tolerance:
-                coverage_shortfall = True
-                coverage_hint = (
-                    f" Requested window ≈ {desired_span}, fetched ≈ {coverage}. Increase 'Max fetch pages', raise"
-                    " 'Query batches', or reduce the window/timeframe."
-                )
+        coverage = fetch_info.coverage
+        target_span = fetch_info.target_coverage
         message = (
             f"Latest data fetch for {symbol_hint} @ {timeframe_hint}: {fetch_info.rows:,} bars"
-            f" from {fetch_info.start} to {fetch_info.end}. Pages {fetch_info.pages}/{fetch_info.max_pages}."
-            f"{coverage_text}"
+            f" from {fetch_info.start} to {fetch_info.end}. Requests {fetch_info.pages}/{fetch_info.max_pages}."
         )
-        if fetch_info.truncated:
-            hint = coverage_hint if coverage_hint else " Increase 'Max fetch pages' to cover the full period."
-            st.warning(message + hint, icon="⚠️")
-        elif coverage_shortfall:
-            st.warning(message + coverage_hint, icon="ℹ️")
+        if coverage is not None and coverage > pd.Timedelta(0):
+            message += f" Coverage ≈{coverage}."
+        if target_span is not None and target_span > pd.Timedelta(0):
+            message += f" Requested ≈{target_span}."
+        if not fetch_info.reached_target and target_span is not None:
+            st.warning(
+                message + " Exchange returned less data than requested; automatic retries were exhausted.",
+                icon="ℹ️",
+            )
         else:
-            st.info(message)
+            st.info(message, icon="ℹ️")
 
     error_message = st.session_state.get("builder_error")
     results_payload = st.session_state.get("builder_results")
@@ -2210,36 +2199,10 @@ def render_strategy_generator():
             "Override start (optional, UTC ISO8601)", value="", key="compose_since_override"
         )
         try:
-            _, compose_start = resolve_since(int(window_value), window_unit, since_override)
+            _, compose_start, _ = resolve_since(int(window_value), window_unit, since_override)
             st.caption(f"Approximate start: {compose_start.isoformat()} UTC")
         except ValueError:
             st.caption("Provide a valid ISO8601 override or leave blank to use the window.")
-        limit_per_page = st.number_input(
-            "Rows per page",
-            min_value=100,
-            max_value=1000,
-            value=720,
-            step=10,
-            key="compose_limit",
-        )
-        max_pages = st.number_input(
-            "Max fetch pages",
-            min_value=1,
-            max_value=240,
-            value=10,
-            step=1,
-            key="compose_pages",
-            help="Maximum Kraken API pages to request per batch (each page ≈ limit rows).",
-        )
-        query_batches = st.number_input(
-            "Query batches",
-            min_value=1,
-            max_value=10,
-            value=1,
-            step=1,
-            key="compose_batches",
-            help="Multiply the page allowance to stitch longer validation windows from successive API sweeps.",
-        )
         openai_key = st.text_input(
             "OpenAI API key",
             value="",
@@ -2270,7 +2233,7 @@ uses ATR based stops and trails, and reduces position size during sideways regim
                 raise FileNotFoundError(f"Operator catalog not found: {catalog_file}")
 
             try:
-                since_ms, since_dt = resolve_since(int(window_value), window_unit, since_override)
+                since_ms, since_dt, window_delta = resolve_since(int(window_value), window_unit, since_override)
             except ValueError as exc:  # pragma: no cover - user input validation
                 raise ValueError(str(exc)) from exc
 
@@ -2308,19 +2271,23 @@ uses ATR based stops and trails, and reduces position size during sideways regim
 
                 compile_and_load(graph)
 
+                target_end_dt = since_dt + window_delta
+                now_dt = datetime.now(UTC)
+                if target_end_dt > now_dt:
+                    target_end_dt = now_dt
+                target_end_ms = int(target_end_dt.timestamp() * 1000)
                 fetch_result = fetch_ohlcv(
                     symbol.strip(),
                     timeframe,
                     since_ms,
-                    limit_per_page=int(limit_per_page),
-                    max_pages=int(max_pages),
-                    query_batches=int(query_batches),
+                    target_end_ms=target_end_ms,
                 )
                 if fetch_result.data.empty:
                     raise ValueError("No OHLCV data retrieved for validation window.")
 
                 st.session_state["compose_last_fetch"] = fetch_result
                 st.session_state["compose_last_start"] = since_dt
+                st.session_state["compose_last_end"] = target_end_dt
                 st.session_state["compose_last_symbol"] = symbol.strip()
                 st.session_state["compose_last_timeframe"] = timeframe
 
@@ -2342,34 +2309,25 @@ uses ATR based stops and trails, and reduces position size during sideways regim
 
     compose_fetch = st.session_state.get("compose_last_fetch")
     if isinstance(compose_fetch, OHLCVFetchResult):
-        coverage = compose_fetch.coverage
-        coverage_text = f" Coverage: {coverage}." if coverage else ""
         symbol_hint = st.session_state.get("compose_last_symbol", symbol)
         timeframe_hint = st.session_state.get("compose_last_timeframe", timeframe)
-        requested_start = st.session_state.get("compose_last_start")
-        coverage_shortfall = False
-        coverage_hint = ""
-        if coverage and isinstance(requested_start, datetime):
-            desired_span = pd.to_timedelta(datetime.now(UTC) - requested_start)
-            tolerance = pd.Timedelta(minutes=1)
-            if desired_span > coverage + tolerance:
-                coverage_shortfall = True
-                coverage_hint = (
-                    f" Requested window ≈ {desired_span}, fetched ≈ {coverage}. Increase 'Max fetch pages', raise"
-                    " 'Query batches', or reduce the window/timeframe."
-                )
+        coverage = compose_fetch.coverage
+        target_span = compose_fetch.target_coverage
         fetch_message = (
             f"Validation data for {symbol_hint} @ {timeframe_hint}: {compose_fetch.rows:,} bars"
-            f" from {compose_fetch.start} to {compose_fetch.end}. Pages {compose_fetch.pages}/{compose_fetch.max_pages}."
-            f"{coverage_text}"
+            f" from {compose_fetch.start} to {compose_fetch.end}. Requests {compose_fetch.pages}/{compose_fetch.max_pages}."
         )
-        if compose_fetch.truncated:
-            hint = coverage_hint if coverage_hint else " Increase 'Max fetch pages' to extend the window."
-            st.warning(fetch_message + hint, icon="⚠️")
-        elif coverage_shortfall:
-            st.warning(fetch_message + coverage_hint, icon="ℹ️")
+        if coverage is not None and coverage > pd.Timedelta(0):
+            fetch_message += f" Coverage ≈{coverage}."
+        if target_span is not None and target_span > pd.Timedelta(0):
+            fetch_message += f" Requested ≈{target_span}."
+        if not compose_fetch.reached_target and target_span is not None:
+            st.warning(
+                fetch_message + " Exchange returned less data than requested; automatic retries were exhausted.",
+                icon="ℹ️",
+            )
         else:
-            st.info(fetch_message)
+            st.info(fetch_message, icon="ℹ️")
 
     compose_error = st.session_state.get("compose_error")
     compose_result = st.session_state.get("compose_result")
