@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
-from pydantic import BaseModel, create_model
+from .pydantic_shim import BaseModel, create_model
 
 from .schemas import StrategyGraph
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Mapping, MutableMapping, Type
 
-from pydantic import BaseModel
+from .pydantic_shim import BaseModel
 
 from . import __version__
 from .schemas import BreakoutPullbackParams, RegimeParams, TrendATRParams

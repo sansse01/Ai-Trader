@@ -6,7 +6,7 @@ from decimal import Decimal
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field, condecimal, validator
+from .pydantic_shim import BaseModel, Field, condecimal, validator
 
 
 class TrendATRParams(BaseModel):

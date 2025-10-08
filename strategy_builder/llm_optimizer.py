@@ -6,7 +6,7 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
-from pydantic import ValidationError
+from .pydantic_shim import ValidationError
 
 from .registry import StrategyRegistry
 from .schemas import OptimizeResponse
