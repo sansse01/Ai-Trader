@@ -187,8 +187,46 @@ def fetch_ohlcv(
         if max_ts is None or ts > max_ts:
             max_ts = ts
 
-    def _ingest(rows: list[list[float]]) -> bool:
+    def _has_target_coverage() -> bool:
+        if min_ts is None or max_ts is None:
+            return False
+        coverage_ms = max_ts - min_ts
+        return desired_span_ms <= 0 or coverage_ms + tolerance_ms >= desired_span_ms
+
+    def _fetch_chunk(cursor: int) -> Optional[list[list[float]]]:
+        try:
+            return ex.fetch_ohlcv(
+                sym,
+                timeframe,
+                since=int(cursor),
+                limit=limit_per_page,
+            )
+        except rate_limit_exc:
+            time.sleep(1.25)
+            return None
+        except Exception:
+            return None
+
+    def _fetch_chunk_with_params(cursor: int, extra_params: dict[str, object]) -> Optional[list[list[float]]]:
+        try:
+            return ex.fetch_ohlcv(
+                sym,
+                timeframe,
+                since=int(cursor),
+                limit=limit_per_page,
+                params=extra_params,
+            )
+        except rate_limit_exc:
+            time.sleep(1.25)
+            return None
+        except Exception:
+            return None
+
+    def _ingest_chunk(rows: Optional[list[list[float]]]) -> tuple[bool, Optional[int]]:
+        if not rows:
+            return False, None
         added = False
+        newest = None
         for row in rows:
             if not row:
                 continue
@@ -201,164 +239,115 @@ def fetch_ohlcv(
             all_rows.append(row)
             _update_bounds(ts)
             added = True
-        return added
-
-    def _has_target_coverage() -> bool:
-        if min_ts is None or max_ts is None:
-            return False
-        coverage_ms = max_ts - min_ts
-        return desired_span_ms <= 0 or coverage_ms + tolerance_ms >= desired_span_ms
+            if newest is None or ts > newest:
+                newest = ts
+        return added, newest
 
     params = {"paginate": True, "paginationCalls": page_budget}
-    try:
-        raw_rows = ex.fetch_ohlcv(
-            sym,
-            timeframe,
-            since=since_ms,
-            limit=limit_per_page,
-            params=params,
-        )
-    except TypeError:
-        raw_rows = None
-    except Exception:
-        raw_rows = None
-    else:
+
+    raw_rows = _fetch_chunk_with_params(since_ms, params)
+    if raw_rows is not None:
         pages_used += 1
         rows_list = list(raw_rows or [])
         if rows_list:
-            _ingest(rows_list)
+            _ingest_chunk(rows_list)
             pages_hint = min(page_budget, max(1, math.ceil(len(rows_list) / max(limit_per_page, 1))))
         else:
             pages_hint = 1
+    else:
+        pages_hint = 0
 
-    def _forward_fill(start_cursor: int, pages_so_far: int) -> int:
+    def _forward_paginate(start_cursor: int, pages_so_far: int) -> int:
         cursor = start_cursor
         idle = 0
         max_idle = 3
         while pages_so_far < page_budget and cursor <= target_end_ms + tolerance_ms:
-            try:
-                chunk = ex.fetch_ohlcv(sym, timeframe, since=int(cursor), limit=limit_per_page)
-            except rate_limit_exc:
-                time.sleep(1.25)
-                continue
-            except Exception:
-                break
-            pages_so_far += 1
-            if not chunk:
+            chunk = _fetch_chunk(cursor)
+            if chunk is None:
                 idle += 1
                 if idle >= max_idle:
                     cursor += max(chunk_span_ms, timeframe_ms)
                     idle = 0
                 else:
                     cursor += timeframe_ms
-                time.sleep(0.2)
                 continue
 
-            idle = 0
-            last_ts = cursor
-            added = False
-            for row in chunk:
-                if not row:
-                    continue
-                ts = int(row[0])
-                if ts < since_ms or ts > target_end_ms + tolerance_ms:
-                    continue
-                if ts in seen_ts:
-                    continue
-                seen_ts.add(ts)
-                all_rows.append(row)
-                _update_bounds(ts)
-                added = True
-                if ts > last_ts:
-                    last_ts = ts
-
-            time.sleep(0.2)
-
-            if added:
-                cursor = last_ts + timeframe_ms
+            pages_so_far += 1
+            added, newest = _ingest_chunk(chunk)
+            if added and newest is not None:
+                cursor = newest + timeframe_ms
+                idle = 0
             else:
-                cursor += timeframe_ms
+                idle += 1
+                if idle >= max_idle:
+                    cursor += max(chunk_span_ms, timeframe_ms)
+                    idle = 0
+                else:
+                    cursor += timeframe_ms
 
             if _has_target_coverage():
                 break
+
+            time.sleep(0.2)
+
         return pages_so_far
 
-    def _backfill(pages_so_far: int) -> int:
+    def _backfill_paginate(pages_so_far: int) -> int:
         if min_ts is None:
             return pages_so_far
 
-        cursor = min_ts - chunk_span_ms
+        cursor = max(min_ts - chunk_span_ms, 0)
         idle = 0
         max_idle = 3
         while pages_so_far < page_budget and cursor + tolerance_ms >= since_ms:
-            raw_cursor = cursor
-            cursor = max(cursor, 0)
-            try:
-                chunk = ex.fetch_ohlcv(sym, timeframe, since=int(cursor), limit=limit_per_page)
-            except rate_limit_exc:
-                time.sleep(1.25)
-                continue
-            except Exception:
-                break
-
-            pages_so_far += 1
-            if not chunk:
+            chunk = _fetch_chunk(cursor)
+            if chunk is None:
                 idle += 1
                 if idle >= max_idle:
-                    if raw_cursor <= 0:
+                    if cursor <= 0:
                         break
-                    cursor = raw_cursor - max(chunk_span_ms, timeframe_ms)
+                    cursor = max(cursor - max(chunk_span_ms, timeframe_ms), 0)
                     idle = 0
                 else:
-                    cursor = raw_cursor - timeframe_ms
-                time.sleep(0.2)
+                    cursor = max(cursor - timeframe_ms, 0)
                 continue
 
-            idle = 0
-            added = False
-            oldest = min_ts
-            for row in chunk:
-                if not row:
-                    continue
-                ts = int(row[0])
-                if ts < since_ms or ts > target_end_ms + tolerance_ms:
-                    continue
-                if ts in seen_ts:
-                    continue
-                seen_ts.add(ts)
-                all_rows.append(row)
-                _update_bounds(ts)
-                added = True
-                if oldest is None or ts < oldest:
-                    oldest = ts
-
-            time.sleep(0.2)
-
+            pages_so_far += 1
+            added, _ = _ingest_chunk(chunk)
             if added:
-                current_min = min_ts if min_ts is not None else oldest
-                if current_min is None:
-                    cursor -= chunk_span_ms
-                else:
-                    cursor = current_min - chunk_span_ms
+                cursor = max((min_ts or since_ms) - chunk_span_ms, 0)
+                idle = 0
             else:
-                if raw_cursor <= 0:
-                    break
-                cursor = raw_cursor - max(chunk_span_ms, timeframe_ms)
+                idle += 1
+                if idle >= max_idle:
+                    if cursor <= 0:
+                        break
+                    cursor = max(cursor - max(chunk_span_ms, timeframe_ms), 0)
+                    idle = 0
+                else:
+                    cursor = max(cursor - timeframe_ms, 0)
 
             if _has_target_coverage():
                 break
+
+            time.sleep(0.2)
+
         return pages_so_far
 
     if not _has_target_coverage():
         start_cursor = since_ms if max_ts is None else max(max_ts + timeframe_ms, since_ms)
-        pages_used = _forward_fill(start_cursor, pages_used)
+        pages_used = _forward_paginate(start_cursor, pages_used)
 
     if not _has_target_coverage() and min_ts is not None and min_ts > since_ms + tolerance_ms:
-        pages_used = _backfill(pages_used)
+        pages_used = _backfill_paginate(pages_used)
 
     if not _has_target_coverage():
         start_cursor = since_ms if max_ts is None else max(max_ts + timeframe_ms, since_ms)
-        pages_used = _forward_fill(start_cursor, pages_used)
+        pages_used = _forward_paginate(start_cursor, pages_used)
+
+    unique_rows = len(all_rows)
+    if pages_hint <= 0 and unique_rows:
+        pages_hint = math.ceil(unique_rows / max(limit_per_page, 1))
 
     pages = max(pages_hint, pages_used)
 
