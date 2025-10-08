@@ -419,64 +419,83 @@ def fetch_ohlcv(
     page_budget = max(min(approx_pages + 5, 2400), 4)
 
     tolerance_ms = max(timeframe_ms, 60_000)
+    params = {"paginate": True, "paginationCalls": page_budget}
     all_rows: list[list[float]] = []
-    seen_ts: set[int] = set()
-    cursor_end = target_end_ms
     pages = 0
-    stalls = 0
 
-    while pages < page_budget and cursor_end > since_ms - timeframe_ms:
-        request_since = max(since_ms, cursor_end - chunk_span_ms - timeframe_ms)
-        try:
-            ohlcv = ex.fetch_ohlcv(sym, timeframe, since=request_since, limit=limit_per_page)
-        except ccxt.RateLimitExceeded:
-            time.sleep(1.25)
-            continue
-        except Exception:
-            break
-        if not ohlcv:
-            break
+    def _manual_fetch() -> tuple[list[list[float]], int]:
+        rows: list[list[float]] = []
+        seen_ts: set[int] = set()
+        cursor = since_ms
+        calls = 0
+        idle = 0
+        max_idle = 3
+        while calls < page_budget and cursor <= target_end_ms + tolerance_ms:
+            try:
+                ohlcv_chunk = ex.fetch_ohlcv(sym, timeframe, since=int(cursor), limit=limit_per_page)
+            except ccxt.RateLimitExceeded:
+                time.sleep(1.25)
+                continue
+            except Exception:
+                break
+            if not ohlcv_chunk:
+                idle += 1
+                if idle >= max_idle:
+                    cursor += max(chunk_span_ms, timeframe_ms)
+                    idle = 0
+                else:
+                    cursor += timeframe_ms
+                time.sleep(0.2)
+                continue
 
-        pages += 1
-        filtered_rows: list[list[float]] = []
-        for row in ohlcv:
-            ts = int(row[0])
-            if ts in seen_ts:
-                continue
-            if ts < since_ms:
-                continue
-            if ts > cursor_end:
-                continue
-            seen_ts.add(ts)
-            filtered_rows.append(row)
+            idle = 0
+            calls += 1
+            filtered: list[list[float]] = []
+            last_ts = cursor
+            for row in ohlcv_chunk:
+                ts = int(row[0])
+                if ts < since_ms or ts > target_end_ms + tolerance_ms:
+                    continue
+                if ts in seen_ts:
+                    continue
+                seen_ts.add(ts)
+                filtered.append(row)
+                if ts > last_ts:
+                    last_ts = ts
 
-        if not filtered_rows:
-            stalls += 1
-            if stalls >= 3:
-                cursor_end = max(since_ms, cursor_end - chunk_span_ms)
-                stalls = 0
+            if filtered:
+                rows.extend(filtered)
+                advance = last_ts + timeframe_ms
+                if advance <= cursor:
+                    advance = cursor + timeframe_ms
+                cursor = advance
             else:
-                cursor_end = max(since_ms, cursor_end - timeframe_ms)
-            if cursor_end <= since_ms:
-                break
+                cursor += timeframe_ms
+
             time.sleep(0.2)
-            continue
 
-        stalls = 0
-        all_rows.extend(filtered_rows)
+            if rows:
+                coverage_ms = rows[-1][0] - rows[0][0]
+                if desired_span_ms <= 0 or coverage_ms + tolerance_ms >= desired_span_ms:
+                    break
+        return rows, calls
 
-        earliest = min(row[0] for row in filtered_rows)
-        cursor_end = min(cursor_end, earliest - timeframe_ms)
-        if cursor_end < since_ms:
-            cursor_end = since_ms
-
-        time.sleep(0.2)
-
+    try:
+        raw_rows = ex.fetch_ohlcv(
+            sym,
+            timeframe,
+            since=since_ms,
+            limit=limit_per_page,
+            params=params,
+        )
+        all_rows = list(raw_rows or [])
         if all_rows:
-            sorted_ts = sorted(row[0] for row in all_rows)
-            coverage_ms = sorted_ts[-1] - sorted_ts[0]
-            if desired_span_ms <= 0 or coverage_ms + tolerance_ms >= desired_span_ms:
-                break
+            pages = min(page_budget, max(1, math.ceil(len(all_rows) / max(limit_per_page, 1))))
+    except TypeError:
+        all_rows, pages = _manual_fetch()
+    except Exception:
+        all_rows, pages = _manual_fetch()
+
     if not all_rows:
         empty = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
         empty.index = pd.DatetimeIndex([], tz="UTC")
@@ -490,7 +509,20 @@ def fetch_ohlcv(
             target_coverage=pd.to_timedelta(desired_span_ms, unit="ms"),
             reached_target=False,
         )
-    df = pd.DataFrame(all_rows, columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"])
+    # Deduplicate and enforce the requested window bounds
+    filtered_rows: list[list[float]] = []
+    seen_ts: set[int] = set()
+    for row in all_rows:
+        ts = int(row[0])
+        if ts < since_ms or ts > target_end_ms + tolerance_ms:
+            continue
+        if ts in seen_ts:
+            continue
+        seen_ts.add(ts)
+        filtered_rows.append(row)
+
+    filtered_rows.sort(key=lambda item: item[0])
+    df = pd.DataFrame(filtered_rows, columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"])
     df["Timestamp"] = pd.to_datetime(df["Timestamp"], unit="ms", utc=True)
     df = df.drop_duplicates(subset=["Timestamp"]).set_index("Timestamp").sort_index()
     requested_start = pd.to_datetime(since_ms, unit="ms", utc=True)

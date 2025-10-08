@@ -180,7 +180,42 @@ class TradingStrategyRunner:
 
         metrics_frame = prepared.reset_index().rename(columns={"index": "Timestamp"})
         metrics_frame["Timestamp"] = pd.to_datetime(metrics_frame["Timestamp"], utc=True)
-        return _metrics_from_equity(managed_equity, metrics_frame)
+        metrics = _metrics_from_equity(managed_equity, metrics_frame)
+
+        overrides: Dict[str, Any] = {}
+        if hasattr(stats, "get"):
+            try:
+                win_rate = stats.get("Win Rate [%]")
+                trades_count = stats.get("# Trades") or stats.get("Trades")
+                avg_win = stats.get("Avg. Win [%]")
+                avg_loss = stats.get("Avg. Loss [%]")
+            except Exception:
+                win_rate = trades_count = avg_win = avg_loss = None
+            else:
+                if win_rate is not None:
+                    overrides["hit_rate"] = float(win_rate) / 100.0
+                if trades_count is not None:
+                    overrides["trades"] = int(trades_count)
+                if avg_win is not None:
+                    overrides["avg_win"] = float(avg_win) / 100.0
+                if avg_loss is not None:
+                    overrides["avg_loss"] = float(avg_loss) / 100.0
+
+        if overrides:
+            try:
+                metrics = metrics.model_copy(update=overrides)  # type: ignore[attr-defined]
+            except AttributeError:  # pragma: no cover - pydantic v1 fallback
+                try:
+                    metrics = metrics.copy(update=overrides)  # type: ignore[attr-defined]
+                except AttributeError:  # pragma: no cover - final fallback
+                    if hasattr(metrics, "model_dump"):
+                        payload = metrics.model_dump()
+                    else:
+                        payload = metrics.dict()
+                    payload.update(overrides)
+                    metrics = Metrics.parse_obj(payload)
+
+        return metrics
 
 
 def _true_range(data: pd.DataFrame) -> pd.Series:
@@ -199,9 +234,20 @@ def _align_equity_index(equity: pd.Series, data: pd.DataFrame) -> pd.Series:
 
 
 def _metrics_from_equity(equity: pd.Series, data: pd.DataFrame) -> Metrics:
+    if equity.empty:
+        raise ValueError("Equity curve is empty; cannot compute metrics")
+
+    equity = equity.astype(float).copy()
+    initial = float(equity.iloc[0]) if len(equity) else 1.0
+    if not np.isfinite(initial) or initial == 0:
+        initial = 1.0
+    equity /= initial
+    if len(equity):
+        equity.iloc[0] = 1.0
+
     returns = equity.pct_change().fillna(0)
-    total_return = float(equity.iloc[-1] - 1)
-    periods = len(returns)
+    total_return = float(equity.iloc[-1] - 1.0)
+    periods = max(len(returns), 1)
     bar_seconds = _infer_bar_seconds(data)
     seconds_per_year = 365.25 * 24 * 60 * 60
     periods_per_year = max(seconds_per_year / max(bar_seconds, 1e-9), 1e-9)
