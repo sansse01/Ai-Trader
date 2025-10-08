@@ -17,15 +17,25 @@ class _FakeExchangeNamespace:
 
 
 class FakeKrakenExchange:
+    timeframes = {"1h": 60}
+
     def __init__(self, start_ms: int, rows: int, frame_ms: int) -> None:
         self.start_ms = start_ms
         self.rows = rows
         self.frame_ms = frame_ms
-        self.market = {"BTC/EUR": {}}
+        self.market = {"BTC/EUR": {"id": "BTC/EUR"}}
         self.calls: list[dict[str, object]] = []
+        self.public_calls: list[dict[str, object]] = []
+        self.manual_limit = 720
 
     def load_markets(self):
         return self.market
+
+    def market(self, symbol: str) -> dict[str, object]:
+        info = self.market.get(symbol)
+        if info is None:
+            raise KeyError(symbol)
+        return info
 
     def fetch_ohlcv(self, symbol, timeframe, since=None, limit=None, params=None):
         limit = limit or 720
@@ -51,9 +61,39 @@ class FakeKrakenExchange:
             rows.append(self._build_row(idx))
         return rows
 
+    def publicGetOHLC(self, request):
+        self.public_calls.append(dict(request))
+        since = float(request.get("since", 0))
+        since_ms = int(since * 1000)
+        start_idx = 0
+        if since_ms > self.start_ms:
+            start_idx = max(int((since_ms - self.start_ms) // self.frame_ms), 0)
+        rows = []
+        for offset in range(self.manual_limit):
+            idx = start_idx + offset
+            if idx >= self.rows:
+                break
+            rows.append(self._build_raw_row(idx))
+        last_idx = start_idx + len(rows)
+        last_ms = self.start_ms + last_idx * self.frame_ms
+        return {"result": {"BTC/EUR": rows, "last": int(last_ms / 1000)}}
+
     def _build_row(self, index: int) -> list[float]:
         ts = self.start_ms + index * self.frame_ms
         return [ts, 1.0, 2.0, 0.5, 1.5, 100.0]
+
+    def _build_raw_row(self, index: int) -> list[object]:
+        ts = (self.start_ms + index * self.frame_ms) // 1000
+        return [
+            ts,
+            "1.0",
+            "2.0",
+            "0.5",
+            "1.5",
+            "100.0",
+            "100.0",
+            0,
+        ]
 
 
 class LateChunkKrakenExchange(FakeKrakenExchange):
@@ -83,6 +123,9 @@ class AutoPagingKrakenExchange(FakeKrakenExchange):
             return [self._build_row(i) for i in range(self.rows)]
         pytest.fail("Manual pagination should not be triggered when auto pagination succeeds")
 
+    def publicGetOHLC(self, request):  # pragma: no cover - autopagination path only
+        pytest.fail("publicGetOHLC should not be called when auto pagination succeeds")
+
 
 def test_fetch_ohlcv_falls_back_to_manual_pagination(monkeypatch):
     hours = 60 * 24
@@ -111,6 +154,7 @@ def test_fetch_ohlcv_falls_back_to_manual_pagination(monkeypatch):
     assert isinstance(result.coverage, pd.Timedelta)
     expected = pd.Timedelta(days=60) - pd.Timedelta(milliseconds=frame_ms)
     assert result.coverage >= expected
+    assert fake_exchange.public_calls, "publicGetOHLC should be used for manual pagination"
 
 
 def test_fetch_ohlcv_backfills_when_initial_window_is_recent(monkeypatch):
@@ -140,6 +184,7 @@ def test_fetch_ohlcv_backfills_when_initial_window_is_recent(monkeypatch):
     assert result.start == pd.to_datetime(start_ms, unit="ms", utc=True)
     expected_end = pd.to_datetime(end_ms - frame_ms, unit="ms", utc=True)
     assert result.end == expected_end
+    assert fake_exchange.public_calls, "publicGetOHLC should drive the manual backfill"
 
 
 def test_fetch_ohlcv_uses_ccxt_pagination_when_available(monkeypatch):
@@ -173,3 +218,4 @@ def test_fetch_ohlcv_uses_ccxt_pagination_when_available(monkeypatch):
     expected_calls = max(1, min(result.max_pages, 200))
     assert params.get("paginationCalls") == expected_calls
     assert params.get("until") == end_ms
+    assert fake_exchange.public_calls == []

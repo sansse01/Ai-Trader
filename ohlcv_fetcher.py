@@ -198,9 +198,102 @@ def fetch_ohlcv(
         coverage_ms = max_ts - min_ts
         return desired_span_ms <= 0 or coverage_ms + tolerance_ms >= desired_span_ms
 
-    def _fetch_chunk(cursor: int) -> Optional[list[list[float]]]:
+    market_id = sym
+    market_info = None
+    try:
+        market_info = ex.market(sym)
+        market_id = market_info.get("id", market_id)
+    except Exception:
+        market_info = None
+
+    timeframes_map = getattr(ex, "timeframes", None)
+    interval_minutes: Optional[int] = None
+    if isinstance(timeframes_map, dict):
+        value = timeframes_map.get(timeframe)
+        if value is not None:
+            try:
+                interval_minutes = int(value)
+            except Exception:
+                interval_minutes = None
+    if interval_minutes is None and timeframe_seconds:
         try:
-            return ex.fetch_ohlcv(
+            interval_minutes = max(int(timeframe_seconds // 60), 1)
+        except Exception:
+            interval_minutes = None
+
+    manual_uses_public = hasattr(ex, "publicGetOHLC")
+
+    def _parse_public_rows(raw_rows: list) -> list[list[float]]:
+        if not raw_rows:
+            return []
+        if market_info is not None and hasattr(ex, "parse_ohlcvs"):
+            try:
+                parsed = ex.parse_ohlcvs(raw_rows, market_info, timeframe, None, limit_per_page)
+                if isinstance(parsed, list):
+                    return [list(item) for item in parsed]
+            except Exception:
+                pass
+
+        parsed_rows: list[list[float]] = []
+        for row in raw_rows:
+            if not row:
+                continue
+            try:
+                ts_raw = row[0]
+                ts = int(float(ts_raw) * 1000)
+            except Exception:
+                continue
+            try:
+                open_ = float(row[1])
+                high = float(row[2])
+                low = float(row[3])
+                close = float(row[4])
+            except Exception:
+                continue
+            volume_index = 6 if len(row) > 6 else 5
+            try:
+                volume = float(row[volume_index])
+            except Exception:
+                volume = 0.0
+            parsed_rows.append([ts, open_, high, low, close, volume])
+        return parsed_rows
+
+    def _fetch_chunk(cursor: int) -> tuple[Optional[list[list[float]]], Optional[int], bool]:
+        if manual_uses_public and interval_minutes:
+            request = {"pair": market_id, "interval": interval_minutes}
+            frame_seconds = max(int(timeframe_seconds or 60), 1)
+            try:
+                since_seconds = max(int(cursor // 1000), 0)
+            except Exception:
+                since_seconds = 0
+            request["since"] = str(max(since_seconds - frame_seconds, 0))
+            try:
+                response = ex.publicGetOHLC(request)
+            except rate_limit_exc:
+                time.sleep(1.25)
+                return None, None, False
+            except Exception:
+                return None, None, False
+
+            result = {}
+            if isinstance(response, dict):
+                result = response.get("result", {}) or {}
+            raw_rows = []
+            if isinstance(result, dict):
+                raw_rows = result.get(market_id, []) or []
+            rows = _parse_public_rows(list(raw_rows))
+
+            last_ms: Optional[int] = None
+            if isinstance(result, dict) and "last" in result:
+                try:
+                    last_ms = int(float(result["last"]) * 1000)
+                except Exception:
+                    last_ms = None
+
+            return rows, last_ms, True
+
+        try:
+            rows = ex.fetch_ohlcv(
                 sym,
                 timeframe,
                 since=int(cursor),
@@ -208,9 +301,10 @@ def fetch_ohlcv(
             )
         except rate_limit_exc:
             time.sleep(1.25)
-            return None
+            return None, None, False
         except Exception:
-            return None
+            return None, None, False
+        return rows or [], None, True
 
     def _ingest_chunk(rows: Optional[list[list[float]]]) -> tuple[bool, Optional[int]]:
         if not rows:
@@ -255,8 +349,8 @@ def fetch_ohlcv(
             _ingest_chunk(auto_rows)
 
     if not _has_target_coverage():
-        first_chunk = _fetch_chunk(since_ms)
-        if first_chunk is not None:
+        first_chunk, _, ok = _fetch_chunk(since_ms)
+        if ok:
             pages_used += 1
             added, newest = _ingest_chunk(first_chunk)
             if added and newest is not None:
@@ -269,8 +363,8 @@ def fetch_ohlcv(
         idle = 0
         max_idle = 3
         while pages_so_far < page_budget and cursor <= target_end_ms + tolerance_ms:
-            chunk = _fetch_chunk(cursor)
-            if chunk is None:
+            chunk, hint_cursor, ok = _fetch_chunk(cursor)
+            if not ok:
                 idle += 1
                 if idle >= max_idle:
                     cursor += max(chunk_span_ms, timeframe_ms)
@@ -282,7 +376,13 @@ def fetch_ohlcv(
             pages_so_far += 1
             added, newest = _ingest_chunk(chunk)
             if added and newest is not None:
-                cursor = newest + timeframe_ms
+                next_cursor = newest + timeframe_ms
+                if hint_cursor is not None:
+                    next_cursor = max(next_cursor, hint_cursor)
+                if next_cursor <= cursor:
+                    cursor += max(chunk_span_ms, timeframe_ms)
+                else:
+                    cursor = next_cursor
                 idle = 0
             else:
                 idle += 1
@@ -307,8 +407,8 @@ def fetch_ohlcv(
         idle = 0
         max_idle = 3
         while pages_so_far < page_budget and cursor + tolerance_ms >= since_ms:
-            chunk = _fetch_chunk(cursor)
-            if chunk is None:
+            chunk, _, ok = _fetch_chunk(cursor)
+            if not ok:
                 idle += 1
                 if idle >= max_idle:
                     if cursor <= since_ms:
