@@ -1,6 +1,7 @@
 
 import itertools
 import json
+import logging
 import math
 import time
 import uuid
@@ -31,6 +32,8 @@ from strategy_builder.llm_optimizer import LLMOptimizer
 from strategy_builder.registry import StrategyRegistry
 from strategy_builder.schemas import StrategyGraph
 
+LOGGER = logging.getLogger(__name__)
+
 st.set_page_config(page_title="AI Trader Workspace", layout="wide")
 
 GPT5_MODEL_CAPTION = (
@@ -56,13 +59,13 @@ def make_json_safe(value: Any) -> Any:
         return {key: make_json_safe(val) for key, val in value.items()}
     if isinstance(value, (list, tuple, set)):
         return [make_json_safe(item) for item in value]
+    if hasattr(value, "model_dump") and callable(getattr(value, "model_dump")):
+        return make_json_safe(value.model_dump())
     if hasattr(value, "dict") and callable(getattr(value, "dict")):
         try:
             return make_json_safe(value.dict())
         except TypeError:
             pass
-    if hasattr(value, "model_dump") and callable(getattr(value, "model_dump")):
-        return make_json_safe(value.model_dump())
     if isinstance(value, Decimal):
         return float(value)
     if isinstance(value, datetime):
@@ -111,9 +114,7 @@ class OHLCVFetchResult:
 
     @property
     def truncated(self) -> bool:
-        if self.reached_target:
-            return False
-        return self.pages >= self.max_pages
+        return not self.reached_target
 
 
 def window_to_timedelta(window_value: int, window_unit: str) -> timedelta:
@@ -413,34 +414,69 @@ def fetch_ohlcv(
         target_end_ms = since_ms + timeframe_ms
 
     desired_span_ms = max(0, target_end_ms - since_ms)
-    approx_bars = math.ceil(desired_span_ms / timeframe_ms) if timeframe_ms else 0
-    approx_pages = math.ceil(approx_bars / limit_per_page) if approx_bars else 1
+    chunk_span_ms = limit_per_page * timeframe_ms
+    approx_pages = math.ceil(desired_span_ms / chunk_span_ms) if chunk_span_ms else 1
     page_budget = max(min(approx_pages + 5, 2400), 4)
 
     tolerance_ms = max(timeframe_ms, 60_000)
     all_rows: list[list[float]] = []
-    cursor = since_ms
+    seen_ts: set[int] = set()
+    cursor_end = target_end_ms
     pages = 0
+    stalls = 0
 
-    while pages < page_budget:
+    while pages < page_budget and cursor_end > since_ms - timeframe_ms:
+        request_since = max(since_ms, cursor_end - chunk_span_ms - timeframe_ms)
         try:
-            ohlcv = ex.fetch_ohlcv(sym, timeframe, since=cursor, limit=limit_per_page)
+            ohlcv = ex.fetch_ohlcv(sym, timeframe, since=request_since, limit=limit_per_page)
         except ccxt.RateLimitExceeded:
-            time.sleep(1.25); continue
+            time.sleep(1.25)
+            continue
         except Exception:
             break
         if not ohlcv:
             break
-        all_rows.extend(ohlcv)
-        last_ts = ohlcv[-1][0]
+
         pages += 1
-        if last_ts >= target_end_ms - tolerance_ms:
-            break
-        if len(ohlcv) < limit_per_page:
-            if last_ts >= target_end_ms - tolerance_ms:
+        filtered_rows: list[list[float]] = []
+        for row in ohlcv:
+            ts = int(row[0])
+            if ts in seen_ts:
+                continue
+            if ts < since_ms:
+                continue
+            if ts > cursor_end:
+                continue
+            seen_ts.add(ts)
+            filtered_rows.append(row)
+
+        if not filtered_rows:
+            stalls += 1
+            if stalls >= 3:
+                cursor_end = max(since_ms, cursor_end - chunk_span_ms)
+                stalls = 0
+            else:
+                cursor_end = max(since_ms, cursor_end - timeframe_ms)
+            if cursor_end <= since_ms:
                 break
-        cursor = last_ts + timeframe_ms
+            time.sleep(0.2)
+            continue
+
+        stalls = 0
+        all_rows.extend(filtered_rows)
+
+        earliest = min(row[0] for row in filtered_rows)
+        cursor_end = min(cursor_end, earliest - timeframe_ms)
+        if cursor_end < since_ms:
+            cursor_end = since_ms
+
         time.sleep(0.2)
+
+        if all_rows:
+            sorted_ts = sorted(row[0] for row in all_rows)
+            coverage_ms = sorted_ts[-1] - sorted_ts[0]
+            if desired_span_ms <= 0 or coverage_ms + tolerance_ms >= desired_span_ms:
+                break
     if not all_rows:
         empty = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
         empty.index = pd.DatetimeIndex([], tz="UTC")
@@ -751,7 +787,11 @@ def run_simple_backtest(
 
         def buy(self, *, size: float = 0.9999, **kwargs):
             if not getattr(self, "_risk_engine", None) or not self._risk_engine.enabled:
-                return super().buy(size=size, **kwargs)
+                try:
+                    return super().buy(size=size, **kwargs)
+                except ValueError as exc:  # pragma: no cover - defensive guard
+                    LOGGER.warning("Backtesting buy rejected: %s", exc)
+                    return None
             price = float(self.data.Close[-1])
             ctx, fractional, state = self._risk_prepare_order(float(size), 1, price)
             decision = self._risk_engine.modify_order(ctx, state)
@@ -760,18 +800,26 @@ def run_simple_backtest(
             final_size = decision.size
             if fractional:
                 equity = max(state.equity, 1e-9)
-                final_size = min(0.9999, final_size * price / equity)
-                if final_size <= 0:
+                final_size = float(final_size) * equity / max(price, 1e-9)
+                if final_size <= 1e-9:
                     return None
             else:
                 final_size = float(round(final_size))
                 if final_size <= 0:
                     return None
-            return super().buy(size=final_size, **kwargs)
+            try:
+                return super().buy(size=final_size, **kwargs)
+            except ValueError as exc:  # pragma: no cover - defensive guard
+                LOGGER.warning("Backtesting buy rejected: %s", exc)
+                return None
 
         def sell(self, *, size: float = 0.9999, **kwargs):
             if not getattr(self, "_risk_engine", None) or not self._risk_engine.enabled:
-                return super().sell(size=size, **kwargs)
+                try:
+                    return super().sell(size=size, **kwargs)
+                except ValueError as exc:  # pragma: no cover - defensive guard
+                    LOGGER.warning("Backtesting sell rejected: %s", exc)
+                    return None
             price = float(self.data.Close[-1])
             ctx, fractional, state = self._risk_prepare_order(float(size), -1, price)
             decision = self._risk_engine.modify_order(ctx, state)
@@ -780,14 +828,18 @@ def run_simple_backtest(
             final_size = decision.size
             if fractional:
                 equity = max(state.equity, 1e-9)
-                final_size = min(0.9999, final_size * price / equity)
-                if final_size <= 0:
+                final_size = float(final_size) * equity / max(price, 1e-9)
+                if final_size <= 1e-9:
                     return None
             else:
                 final_size = float(round(final_size))
                 if final_size <= 0:
                     return None
-            return super().sell(size=final_size, **kwargs)
+            try:
+                return super().sell(size=final_size, **kwargs)
+            except ValueError as exc:  # pragma: no cover - defensive guard
+                LOGGER.warning("Backtesting sell rejected: %s", exc)
+                return None
 
     df_bt = prepared_df[["Open", "High", "Low", "Close", "Volume"]].copy()
     df_bt[["Open", "High", "Low", "Close"]] = df_bt[["Open", "High", "Low", "Close"]] * contract_size
@@ -1333,7 +1385,7 @@ def render_trading_console():
         }
         preset_payload = {
             "strategy": selected_strategy_key,
-            "saved_at": datetime.utcnow().isoformat() + "Z",
+            "saved_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
             "params": preset_params,
         }
         if preset_ranges_raw:
@@ -1852,7 +1904,7 @@ def render_trading_console():
                             ]
                             payload = {
                                 "strategy": selected_strategy_key,
-                                "saved_at": datetime.utcnow().isoformat() + "Z",
+                                "saved_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
                                 "objective": {
                                     "metric": objective_metric,
                                     "maximize": bool(maximize_objective),
@@ -2040,7 +2092,7 @@ def render_parameter_generator():
                 evaluations = []
                 card = {
                     "version": registry.version,
-                    "generated_at": datetime.utcnow().isoformat() + "Z",
+                    "generated_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
                     "prompt_hash": DataService.summary_hash(summary),
                     "strategy": strategy_id,
                     "timeframe": timeframe,
@@ -2057,8 +2109,12 @@ def render_parameter_generator():
                     evaluations.append((proposal, metrics, accepted, reason))
                     card["proposals"].append(
                         {
-                            "proposal": proposal.dict(),
-                            "measured": metrics.dict(),
+                            "proposal": proposal.model_dump()
+                            if hasattr(proposal, "model_dump")
+                            else proposal.dict(),
+                            "measured": metrics.model_dump()
+                            if hasattr(metrics, "model_dump")
+                            else metrics.dict(),
                             "accepted": bool(accepted),
                             "reason": reason,
                         }
@@ -2084,7 +2140,9 @@ def render_parameter_generator():
                     champion_accepted, champion_reason = evaluator_accept({}, champion_metrics)
                     card["champion"] = {
                         "params": champion_params,
-                        "metrics": champion_metrics.dict(),
+                        "metrics": champion_metrics.model_dump()
+                        if hasattr(champion_metrics, "model_dump")
+                        else champion_metrics.dict(),
                         "report": report,
                         "accepted": bool(champion_accepted),
                         "reason": champion_reason,
@@ -2153,7 +2211,7 @@ def render_parameter_generator():
 
     card_bytes = json.dumps(make_json_safe(card), indent=2).encode("utf-8")
     file_name = (
-        f"strategy_card_{card['strategy']}_{card['timeframe']}_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}.json"
+        f"strategy_card_{card['strategy']}_{card['timeframe']}_{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}.json"
     )
     st.download_button(
         "Download strategy card",
@@ -2301,7 +2359,7 @@ uses ATR based stops and trails, and reduces position size during sideways regim
                 code = render_strategy_code(graph)
 
                 st.session_state["compose_result"] = {
-                    "graph": graph.dict(),
+                    "graph": graph.model_dump() if hasattr(graph, "model_dump") else graph.dict(),
                     "code": code,
                 }
         except Exception as exc:  # pragma: no cover - defensive user feedback

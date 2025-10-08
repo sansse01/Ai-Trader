@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, Dict
 
 import numpy as np
@@ -237,8 +237,8 @@ def _metrics_from_equity(equity: pd.Series, data: pd.DataFrame) -> Metrics:
         trades=int((position_changes := (returns != 0).sum())),
         turnover=turnover,
         fees_paid=fees_paid,
-        start=data["Timestamp"].iloc[0] if "Timestamp" in data else datetime.utcnow(),
-        end=data["Timestamp"].iloc[-1] if "Timestamp" in data else datetime.utcnow(),
+        start=data["Timestamp"].iloc[0] if "Timestamp" in data else datetime.now(UTC),
+        end=data["Timestamp"].iloc[-1] if "Timestamp" in data else datetime.now(UTC),
         timeframe=timeframe,
     )
     return metrics

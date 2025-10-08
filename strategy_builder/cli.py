@@ -5,7 +5,7 @@ import argparse
 import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Dict
 
@@ -72,7 +72,7 @@ def command_optimize(args: argparse.Namespace) -> int:
 
     card = {
         "version": __version__,
-        "generated_at": datetime.utcnow().isoformat(),
+        "generated_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         "prompt_hash": DataService.summary_hash(summary),
         "strategy": args.strategy,
         "timeframe": args.tf,
@@ -88,8 +88,8 @@ def command_optimize(args: argparse.Namespace) -> int:
         evaluations.append((proposal, metrics, ok, reason))
         card["proposals"].append(
             {
-                "proposal": proposal.dict(),
-                "measured": metrics.dict(),
+                "proposal": proposal.model_dump() if hasattr(proposal, "model_dump") else proposal.dict(),
+                "measured": metrics.model_dump() if hasattr(metrics, "model_dump") else metrics.dict(),
                 "accepted": ok,
                 "reason": reason,
             }
@@ -100,7 +100,7 @@ def command_optimize(args: argparse.Namespace) -> int:
         accepted, reason = evaluator_accept({}, champion_metrics)
         card["champion"] = {
             "params": champion_params,
-            "metrics": champion_metrics.dict(),
+            "metrics": champion_metrics.model_dump() if hasattr(champion_metrics, "model_dump") else champion_metrics.dict(),
             "report": report,
             "accepted": accepted,
             "reason": reason,
@@ -156,7 +156,8 @@ def command_backtest(args: argparse.Namespace) -> int:
     params = json.loads(Path(args.params).read_text())
     backtester = BacktestService()
     metrics = backtester.run(args.strategy, params, df)
-    print(json.dumps(metrics.dict(), indent=2, default=_json_default))
+    payload = metrics.model_dump() if hasattr(metrics, "model_dump") else metrics.dict()
+    print(json.dumps(payload, indent=2, default=_json_default))
     return 0
 
 
