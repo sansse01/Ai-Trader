@@ -2,8 +2,11 @@
 import itertools
 import json
 import time
+import uuid
+from collections import OrderedDict
 from collections.abc import Mapping
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -15,11 +18,11 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from risk.engine import OrderContext, PortfolioState, RiskEngine, RiskEngineConfig
-from strategies import DEFAULT_STRATEGY_KEY, STRATEGY_REGISTRY
+from strategies import DEFAULT_STRATEGY_KEY, STRATEGY_REGISTRY, register_strategy
 from strategies.base import StrategyDefinition
 from strategy_builder.backtest_svc import BacktestService
 from strategy_builder.builder_graph import GraphValidator, OperatorCatalog, load_graph_from_json
-from strategy_builder.codegen import GraphExecutor, compile_and_load, render_strategy_code
+from strategy_builder.codegen import GraphExecutor, build_param_schema, compile_and_load, render_strategy_code
 from strategy_builder.datasvc import DataService
 from strategy_builder.evaluator import accept as evaluator_accept
 from strategy_builder.evaluator import choose_champion
@@ -70,6 +73,217 @@ def make_json_safe(value: Any) -> Any:
     if isinstance(value, np.datetime64):
         return pd.to_datetime(value).isoformat()
     return value
+
+
+@dataclass(slots=True)
+class OHLCVFetchResult:
+    data: pd.DataFrame
+    pages: int
+    limit_per_page: int
+    max_pages: int
+
+    @property
+    def rows(self) -> int:
+        return int(len(self.data))
+
+    @property
+    def start(self) -> Optional[pd.Timestamp]:
+        if self.data.empty:
+            return None
+        return self.data.index.min()
+
+    @property
+    def end(self) -> Optional[pd.Timestamp]:
+        if self.data.empty:
+            return None
+        return self.data.index.max()
+
+    @property
+    def coverage(self) -> Optional[pd.Timedelta]:
+        if self.start is None or self.end is None:
+            return None
+        return self.end - self.start
+
+    @property
+    def truncated(self) -> bool:
+        return self.pages >= self.max_pages
+
+
+def resolve_since(window_value: int, window_unit: str, override: str = "") -> tuple[int, datetime]:
+    """Resolve the oldest timestamp to request based on a window or override."""
+
+    override_clean = (override or "").strip()
+    if override_clean:
+        parsed = ccxt.kraken().parse8601(override_clean)
+        if parsed is None:
+            raise ValueError("Invalid 'Since' value. Use ISO8601 like 2022-01-01T00:00:00Z")
+        dt = datetime.fromtimestamp(parsed / 1000.0, tz=UTC)
+        return parsed, dt
+
+    unit = window_unit.lower()
+    if unit.startswith("day"):
+        delta = timedelta(days=window_value)
+    elif unit.startswith("month"):
+        delta = timedelta(days=30 * window_value)
+    elif unit.startswith("year"):
+        delta = timedelta(days=365 * window_value)
+    else:
+        delta = timedelta(days=window_value)
+
+    now = datetime.now(UTC)
+    start_dt = now - delta
+    since_ms = int(start_dt.timestamp() * 1000)
+    return since_ms, start_dt
+
+
+def _controls_from_schema(model: Any) -> tuple[OrderedDict[str, Dict[str, Any]], Dict[str, Any]]:
+    controls: OrderedDict[str, Dict[str, Any]] = OrderedDict()
+    defaults: Dict[str, Any] = {}
+
+    for field_name, field in getattr(model, "__fields__", {}).items():
+        field_type = getattr(field, "type_", float)
+        dtype = int if field_type in {int} else float
+        default = field.default
+        if default is None or default is ...:
+            default = 1 if dtype is int else 1.0
+        defaults[field_name] = default
+        if dtype is int:
+            span = max(abs(int(default)) // 2, 1)
+            min_value = int(default) - span
+            max_value = int(default) + span
+            step = 1
+            control = dict(label=field_name.replace("_", " ").title(), dtype=int, min=min_value, max=max_value, value=int(default), step=step)
+        else:
+            span = max(abs(float(default)) * 0.5, 0.5)
+            min_value = float(default) - span
+            max_value = float(default) + span
+            if min_value == max_value:
+                max_value = min_value + 1.0
+            step = round(span / 10, 4) or 0.1
+            control = dict(
+                label=field_name.replace("_", " ").title(),
+                dtype=float,
+                min=min_value,
+                max=max_value,
+                value=float(default),
+                step=step,
+                format="%.4f",
+            )
+        controls[field_name] = control
+
+    return controls, defaults
+
+
+def create_generated_strategy(
+    graph: StrategyGraph,
+    name: str,
+    key: str,
+    description: str,
+) -> StrategyDefinition:
+    schema_model = build_param_schema(graph)
+    controls, param_defaults = _controls_from_schema(schema_model)
+
+    base_defaults = {
+        "risk_fraction": 0.25,
+        "contract_size": 0.001,
+        "allow_shorts": True,
+        "ignore_trend": False,
+        "sizing_mode": "Fraction of equity (0-1)",
+        "initial_cash": 10_000.0,
+    }
+    default_params = {**base_defaults, **param_defaults}
+
+    def _prepare(df: pd.DataFrame, _params: Mapping[str, Any]) -> pd.DataFrame:
+        return df
+
+    def _generate(df: pd.DataFrame, params: Mapping[str, Any]) -> pd.DataFrame:
+        merged = {**default_params, **dict(params)}
+        executor = GraphExecutor(graph=graph, params=merged)
+        outputs = executor.run(df)
+        signals = pd.DataFrame(index=df.index)
+        for col, series in outputs.items():
+            signals[col] = series.reindex(df.index).astype(float)
+        if "position_stream" in signals:
+            position = signals["position_stream"].astype(float)
+        elif not signals.empty:
+            position = signals.iloc[:, 0].astype(float)
+            signals["position_stream"] = position
+        else:
+            position = pd.Series(0.0, index=df.index)
+            signals["position_stream"] = position
+        signals["desired_position"] = position.fillna(0.0)
+        signals["long_signal"] = signals["desired_position"] > 0
+        signals["short_signal"] = signals["desired_position"] < 0
+        return signals
+
+    def _build_backtest(df: pd.DataFrame, df_sig: pd.DataFrame, params: Mapping[str, Any]):
+        from backtesting import Strategy
+
+        merged = {**default_params, **dict(params)}
+        risk_fraction = float(merged.get("risk_fraction", 0.25))
+        sizing_mode = str(merged.get("sizing_mode", "Fraction of equity (0-1)"))
+        allow_shorts = bool(merged.get("allow_shorts", True))
+
+        desired = df_sig.get("desired_position")
+        if desired is None:
+            desired = pd.Series(0.0, index=df.index)
+        desired = desired.reindex(df.index).fillna(0.0)
+
+        class GeneratedGraphStrategy(Strategy):
+            def init(self):  # type: ignore[override]
+                self._desired = desired
+
+            def _position_size(self, price: float) -> float:
+                if sizing_mode.startswith("Whole"):
+                    cash = float(self.equity)
+                    notional = cash * risk_fraction
+                    units = max(1, int(notional / max(price, 1e-9)))
+                    return units
+                return max(0.001, min(0.9999, risk_fraction))
+
+            def next(self):  # type: ignore[override]
+                ts = self.data.index[-1]
+                target = float(self._desired.loc[ts]) if ts in self._desired.index else 0.0
+                if not allow_shorts and target < 0:
+                    target = 0.0
+                if self.position:
+                    if target == 0 or (self.position.is_long and target < 0) or (self.position.is_short and target > 0):
+                        self.position.close()
+                if target > 0 and (not self.position or self.position.is_short):
+                    if self.position and self.position.is_short:
+                        self.position.close()
+                    size = self._position_size(float(self.data.Close[-1]))
+                    self.buy(size=size)
+                elif target < 0 and allow_shorts and (not self.position or self.position.is_long):
+                    if self.position and self.position.is_long:
+                        self.position.close()
+                    size = self._position_size(float(self.data.Close[-1]))
+                    self.sell(size=size)
+
+        return GeneratedGraphStrategy
+
+    return StrategyDefinition(
+        key=key,
+        name=name,
+        description=description,
+        controls=controls,
+        range_controls={},
+        default_params=default_params,
+        data_requirements={
+            "signal_columns": {"long": "long_signal", "short": "short_signal"},
+            "preview_columns": ["desired_position", "long_signal", "short_signal"],
+        },
+        prepare_data=_prepare,
+        generate_signals=_generate,
+        build_simple_backtest_strategy=_build_backtest,
+    )
+
+
+def slugify_strategy_key(value: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in value.lower())
+    cleaned = cleaned.replace("-", "_")
+    cleaned = "_".join(filter(None, cleaned.split("_")))
+    return cleaned or f"generated_{uuid.uuid4().hex[:6]}"
 
 
 def render_llm_controls(prefix: str) -> Tuple[str, Optional[float], Optional[str], Optional[str], Optional[int]]:
@@ -167,7 +381,13 @@ def normalize_symbol(exchange: 'ccxt.Exchange', symbol: str) -> str:
     return symbol
 
 @st.cache_data(show_spinner=False)
-def fetch_ohlcv(symbol: str, timeframe: str, since_ms: int, limit_per_page: int = 720, max_pages: int = 60) -> pd.DataFrame:
+def fetch_ohlcv(
+    symbol: str,
+    timeframe: str,
+    since_ms: int,
+    limit_per_page: int = 720,
+    max_pages: int = 60,
+) -> OHLCVFetchResult:
     ex = ccxt.kraken()
     sym = normalize_symbol(ex, symbol)
     all_rows, cursor, pages = [], since_ms, 0
@@ -187,11 +407,13 @@ def fetch_ohlcv(symbol: str, timeframe: str, since_ms: int, limit_per_page: int 
             break
         time.sleep(0.2)
     if not all_rows:
-        return pd.DataFrame(columns=['Open','High','Low','Close','Volume'])
-    df = pd.DataFrame(all_rows, columns=['Timestamp','Open','High','Low','Close','Volume'])
-    df['Timestamp'] = pd.to_datetime(df['Timestamp'], unit='ms', utc=True)
-    df = df.drop_duplicates(subset=['Timestamp']).set_index('Timestamp').sort_index()
-    return df
+        empty = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+        empty.index = pd.DatetimeIndex([], tz="UTC")
+        return OHLCVFetchResult(empty, pages=pages, limit_per_page=limit_per_page, max_pages=max_pages)
+    df = pd.DataFrame(all_rows, columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"])
+    df["Timestamp"] = pd.to_datetime(df["Timestamp"], unit="ms", utc=True)
+    df = df.drop_duplicates(subset=["Timestamp"]).set_index("Timestamp").sort_index()
+    return OHLCVFetchResult(df, pages=pages, limit_per_page=limit_per_page, max_pages=max_pages)
 
 def plot_chart(
     df: pd.DataFrame,
@@ -1276,18 +1498,23 @@ def render_trading_console():
 
     with st.spinner("Fetching data..."):
         symbol_datasets: Dict[str, Dict[str, pd.DataFrame]] = {}
+        symbol_fetch_info: Dict[str, Dict[str, OHLCVFetchResult]] = {}
         empty_symbols: list[tuple[str, str]] = []
         for group_id, entries in symbol_groups.items():
             group_frames: Dict[str, pd.DataFrame] = {}
+            group_meta: Dict[str, OHLCVFetchResult] = {}
             for entry in entries:
-                df_entry = fetch_ohlcv(entry, timeframe, since_ms)
+                result = fetch_ohlcv(entry, timeframe, since_ms)
+                df_entry = result.data
                 if df_entry.empty:
                     empty_symbols.append((group_id, entry))
                 else:
                     if df_entry.index.tz is None:
                         df_entry.index = df_entry.index.tz_localize('UTC')
                 group_frames[entry] = df_entry
+                group_meta[entry] = result
             symbol_datasets[group_id] = group_frames
+            symbol_fetch_info[group_id] = group_meta
 
     if empty_symbols:
         missing_descriptions = ", ".join(f"{grp}:{sym}" for grp, sym in empty_symbols)
@@ -1296,6 +1523,8 @@ def render_trading_console():
         st.stop()
 
     primary_group = symbol_datasets.get(primary_group_id, {})
+    primary_meta = symbol_fetch_info.get(primary_group_id, {})
+    primary_result = primary_meta.get(symbol)
     df = primary_group.get(symbol)
     if df is None or df.empty:
         st.error("No data fetched. Try: 1) symbol 'XBT/EUR', 2) earlier 'Since', 3) timeframe '1h'.")
@@ -1305,7 +1534,22 @@ def render_trading_console():
     # Data Preview
     # -----------------------------
     st.subheader("Data Preview")
-    st.caption(f"Bars: {len(df):,}  |  Range: {df.index.min()} → {df.index.max()}  |  Timezone: {df.index.tz}")
+    if primary_result:
+        coverage = primary_result.coverage
+        coverage_text = f" | Coverage: {coverage}" if coverage else ""
+        truncation = " (API window capped)" if primary_result.truncated else ""
+        st.caption(
+            f"Bars: {primary_result.rows:,} | Range: {primary_result.start} → {primary_result.end}"
+            f" | Timezone: {df.index.tz}{truncation}{coverage_text}"
+            f" | Requests: {primary_result.pages}/{primary_result.max_pages}"
+        )
+        if primary_result.truncated:
+            st.warning(
+                "Reached the configured page limit while fetching data. Increase 'Max fetch pages' to cover the full window.",
+                icon="⚠️",
+            )
+    else:
+        st.caption(f"Bars: {len(df):,}  |  Range: {df.index.min()} → {df.index.max()}  |  Timezone: {df.index.tz}")
     st.dataframe(df.tail(preview_rows))
     with st.expander("Show first rows"):
         st.dataframe(df.head(preview_rows))
@@ -1318,12 +1562,20 @@ def render_trading_console():
     ):
         with st.expander("Additional symbol datasets"):
             for group_id, group_frames in symbol_datasets.items():
+                group_meta = symbol_fetch_info.get(group_id, {})
                 for sym, sym_df in group_frames.items():
                     if group_id == primary_group_id and sym == symbol:
                         continue
-                    st.caption(
-                        f"{group_id} · {sym} — Bars: {len(sym_df):,} | Range: {sym_df.index.min()} → {sym_df.index.max()}"
-                    )
+                    meta = group_meta.get(sym)
+                    if meta:
+                        st.caption(
+                            f"{group_id} · {sym} — Bars: {meta.rows:,} | Range: {meta.start} → {meta.end}"
+                            f" | Pages: {meta.pages}/{meta.max_pages}"
+                        )
+                    else:
+                        st.caption(
+                            f"{group_id} · {sym} — Bars: {len(sym_df):,} | Range: {sym_df.index.min()} → {sym_df.index.max()}"
+                        )
                     st.dataframe(sym_df.tail(preview_rows))
 
     # -----------------------------
@@ -1582,7 +1834,23 @@ def render_parameter_generator():
         strategy_id = st.selectbox("Strategy", strategy_ids, key="builder_strategy")
         symbol = st.text_input("Symbol (Kraken/ccxt)", value="BTC/EUR", key="builder_symbol")
         timeframe = st.selectbox("Timeframe", timeframe_options, index=timeframe_options.index("1h"), key="builder_timeframe")
-        since_str = st.text_input("Since (UTC ISO8601)", value="2022-01-01T00:00:00Z", key="builder_since")
+        window_value = st.number_input(
+            "Data window", min_value=1, max_value=1825, value=180, step=1, key="builder_window"
+        )
+        window_unit = st.selectbox(
+            "Window unit",
+            ["Days", "Months", "Years"],
+            index=1,
+            key="builder_window_unit",
+        )
+        since_override = st.text_input(
+            "Override start (optional, UTC ISO8601)", value="", key="builder_since_override"
+        )
+        try:
+            _, computed_start = resolve_since(int(window_value), window_unit, since_override)
+            st.caption(f"Approximate start: {computed_start.isoformat()} UTC")
+        except ValueError:
+            st.caption("Provide a valid ISO8601 override or leave blank to use the window.")
         limit_per_page = st.number_input("Rows per page", min_value=100, max_value=1000, value=720, step=10, key="builder_limit")
         max_pages = st.number_input("Max fetch pages", min_value=1, max_value=120, value=20, step=1, key="builder_pages")
         st.subheader("LLM configuration")
@@ -1616,12 +1884,12 @@ def render_parameter_generator():
                 raise ValueError("Symbol is required for data fetch.")
 
             try:
-                since_ms = ccxt.kraken().parse8601(since_str)
-            except Exception as exc:  # pragma: no cover - user input validation
-                raise ValueError("Invalid 'Since' value. Use ISO8601 like 2022-01-01T00:00:00Z") from exc
+                since_ms, since_dt = resolve_since(int(window_value), window_unit, since_override)
+            except ValueError as exc:  # pragma: no cover - user input validation
+                raise ValueError(str(exc)) from exc
 
             with st.spinner("Fetching data and querying the LLM..."):
-                df_raw = fetch_ohlcv(
+                fetch_result = fetch_ohlcv(
                     symbol.strip(),
                     timeframe,
                     since_ms,
@@ -1629,10 +1897,15 @@ def render_parameter_generator():
                     max_pages=int(max_pages),
                 )
 
-                if df_raw.empty:
+                if fetch_result.data.empty:
                     raise ValueError("No OHLCV data retrieved for the requested window.")
 
-                df_reset = df_raw.reset_index().rename(columns={"index": "Timestamp"})
+                st.session_state["builder_last_fetch"] = fetch_result
+                st.session_state["builder_last_start"] = since_dt
+                st.session_state["builder_last_symbol"] = symbol.strip()
+                st.session_state["builder_last_timeframe"] = timeframe
+
+                df_reset = fetch_result.data.reset_index().rename(columns={"index": "Timestamp"})
                 df_reset["Timestamp"] = pd.to_datetime(df_reset["Timestamp"], utc=True)
                 df_reset = df_reset[["Timestamp", "Open", "High", "Low", "Close", "Volume"]]
 
@@ -1751,6 +2024,22 @@ def render_parameter_generator():
         except Exception as exc:  # pragma: no cover - defensive user feedback
             st.session_state["builder_error"] = str(exc)
 
+    fetch_info = st.session_state.get("builder_last_fetch")
+    if isinstance(fetch_info, OHLCVFetchResult):
+        coverage = fetch_info.coverage
+        coverage_text = f" Coverage: {coverage}." if coverage else ""
+        symbol_hint = st.session_state.get("builder_last_symbol", symbol)
+        timeframe_hint = st.session_state.get("builder_last_timeframe", timeframe)
+        message = (
+            f"Latest data fetch for {symbol_hint} @ {timeframe_hint}: {fetch_info.rows:,} bars"
+            f" from {fetch_info.start} to {fetch_info.end}. Pages {fetch_info.pages}/{fetch_info.max_pages}."
+            f"{coverage_text}"
+        )
+        if fetch_info.truncated:
+            st.warning(message + " Increase 'Max fetch pages' to cover the full period.", icon="⚠️")
+        else:
+            st.info(message)
+
     error_message = st.session_state.get("builder_error")
     results_payload = st.session_state.get("builder_results")
 
@@ -1808,7 +2097,23 @@ def render_strategy_generator():
         model, temperature, reasoning_effort, response_verbosity, max_output_tokens = render_llm_controls("compose")
         symbol = st.text_input("Validation symbol", value="BTC/EUR", key="compose_symbol")
         timeframe = st.selectbox("Validation timeframe", timeframe_options, index=timeframe_options.index("1h"), key="compose_timeframe")
-        since_str = st.text_input("Since (UTC ISO8601)", value="2022-01-01T00:00:00Z", key="compose_since")
+        window_value = st.number_input(
+            "Data window", min_value=1, max_value=1825, value=365, step=1, key="compose_window"
+        )
+        window_unit = st.selectbox(
+            "Window unit",
+            ["Days", "Months", "Years"],
+            index=2,
+            key="compose_window_unit",
+        )
+        since_override = st.text_input(
+            "Override start (optional, UTC ISO8601)", value="", key="compose_since_override"
+        )
+        try:
+            _, compose_start = resolve_since(int(window_value), window_unit, since_override)
+            st.caption(f"Approximate start: {compose_start.isoformat()} UTC")
+        except ValueError:
+            st.caption("Provide a valid ISO8601 override or leave blank to use the window.")
         limit_per_page = st.number_input("Rows per page", min_value=100, max_value=1000, value=720, step=10, key="compose_limit")
         max_pages = st.number_input("Max fetch pages", min_value=1, max_value=60, value=10, step=1, key="compose_pages")
         openai_key = st.text_input(
@@ -1841,9 +2146,9 @@ uses ATR based stops and trails, and reduces position size during sideways regim
                 raise FileNotFoundError(f"Operator catalog not found: {catalog_file}")
 
             try:
-                since_ms = ccxt.kraken().parse8601(since_str)
-            except Exception as exc:  # pragma: no cover - user input validation
-                raise ValueError("Invalid 'Since' value. Use ISO8601 like 2022-01-01T00:00:00Z") from exc
+                since_ms, since_dt = resolve_since(int(window_value), window_unit, since_override)
+            except ValueError as exc:  # pragma: no cover - user input validation
+                raise ValueError(str(exc)) from exc
 
             client = None
             if openai_key:
@@ -1879,16 +2184,22 @@ uses ATR based stops and trails, and reduces position size during sideways regim
 
                 compile_and_load(graph)
 
-                df_raw = fetch_ohlcv(
+                fetch_result = fetch_ohlcv(
                     symbol.strip(),
                     timeframe,
                     since_ms,
                     limit_per_page=int(limit_per_page),
                     max_pages=int(max_pages),
                 )
-                if df_raw.empty:
+                if fetch_result.data.empty:
                     raise ValueError("No OHLCV data retrieved for validation window.")
-                df_reset = df_raw.reset_index().rename(columns={"index": "Timestamp"})
+
+                st.session_state["compose_last_fetch"] = fetch_result
+                st.session_state["compose_last_start"] = since_dt
+                st.session_state["compose_last_symbol"] = symbol.strip()
+                st.session_state["compose_last_timeframe"] = timeframe
+
+                df_reset = fetch_result.data.reset_index().rename(columns={"index": "Timestamp"})
                 df_reset["Timestamp"] = pd.to_datetime(df_reset["Timestamp"], utc=True)
                 df_reset = df_reset[["Timestamp", "Open", "High", "Low", "Close", "Volume"]]
 
@@ -1903,6 +2214,22 @@ uses ATR based stops and trails, and reduces position size during sideways regim
                 }
         except Exception as exc:  # pragma: no cover - defensive user feedback
             st.session_state["compose_error"] = str(exc)
+
+    compose_fetch = st.session_state.get("compose_last_fetch")
+    if isinstance(compose_fetch, OHLCVFetchResult):
+        coverage = compose_fetch.coverage
+        coverage_text = f" Coverage: {coverage}." if coverage else ""
+        symbol_hint = st.session_state.get("compose_last_symbol", symbol)
+        timeframe_hint = st.session_state.get("compose_last_timeframe", timeframe)
+        fetch_message = (
+            f"Validation data for {symbol_hint} @ {timeframe_hint}: {compose_fetch.rows:,} bars"
+            f" from {compose_fetch.start} to {compose_fetch.end}. Pages {compose_fetch.pages}/{compose_fetch.max_pages}."
+            f"{coverage_text}"
+        )
+        if compose_fetch.truncated:
+            st.warning(fetch_message + " Increase 'Max fetch pages' to extend the window.", icon="⚠️")
+        else:
+            st.info(fetch_message)
 
     compose_error = st.session_state.get("compose_error")
     compose_result = st.session_state.get("compose_result")
@@ -1929,6 +2256,47 @@ uses ATR based stops and trails, and reduces position size during sideways regim
         mime="text/x-python",
         key="compose_download",
     )
+
+    st.markdown("### Integrate generated strategy")
+    default_name = st.session_state.get("compose_register_name") or "Generated Strategy"
+    name_input = st.text_input("Strategy name", value=default_name, key="compose_register_name")
+    default_key = st.session_state.get("compose_register_key") or slugify_strategy_key(name_input)
+    key_input = st.text_input("Strategy key", value=default_key, key="compose_register_key")
+    default_description = (
+        st.session_state.get("compose_register_description")
+        or f"Generated from spec: {spec_text.strip()[:140]}"
+    )
+    description_input = st.text_area(
+        "Description",
+        value=default_description,
+        height=120,
+        key="compose_register_description",
+    )
+
+    if st.button("Register strategy", key="compose_register_button"):
+        try:
+            name_clean = name_input.strip() or "Generated Strategy"
+            raw_key = key_input.strip() or name_clean
+            key_clean = slugify_strategy_key(raw_key)
+            if key_clean in STRATEGY_REGISTRY:
+                raise ValueError(f"Strategy key '{key_clean}' already exists.")
+            graph_obj = StrategyGraph.parse_obj(compose_result["graph"])
+            description_clean = description_input.strip() or f"Generated from spec: {spec_text.strip()[:140]}"
+            definition = create_generated_strategy(graph_obj, name_clean, key_clean, description_clean)
+            register_strategy(definition)
+            st.session_state["active_strategy"] = key_clean
+            st.session_state["builder_strategy"] = key_clean
+            st.session_state["workspace_mode"] = "Trading Console"
+            st.session_state["compose_register_key"] = key_clean
+            st.session_state["compose_register_name"] = name_clean
+            st.session_state["compose_register_description"] = description_clean
+            if key_clean != raw_key:
+                st.info(f"Strategy key normalised to '{key_clean}'.")
+            st.success(
+                f"Strategy '{name_clean}' registered as '{key_clean}'. It is now available in the trading console and optimizer."
+            )
+        except Exception as exc:
+            st.error(f"Failed to register strategy: {exc}")
 
 
 with st.sidebar:

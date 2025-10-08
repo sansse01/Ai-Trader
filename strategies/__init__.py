@@ -27,6 +27,15 @@ STRATEGY_REGISTRY: Dict[str, StrategyDefinition] = {
 }
 DEFAULT_STRATEGY_KEY = EMA_STRATEGY.key
 
+
+def register_strategy(strategy: StrategyDefinition) -> None:
+    """Register a new strategy definition at runtime."""
+
+    if strategy.key in STRATEGY_REGISTRY:
+        raise ValueError(f"Strategy '{strategy.key}' already registered")
+    STRATEGY_REGISTRY[strategy.key] = strategy
+
+
 __all__ = [
     "StrategyDefinition",
     "STRATEGY_REGISTRY",
@@ -47,4 +56,5 @@ __all__ = [
     "FUNDING_DEFAULT_PARAMS",
     "ema",
     "slope_pct",
+    "register_strategy",
 ]

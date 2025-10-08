@@ -43,6 +43,11 @@ try:  # pragma: no cover
 except Exception:  # pragma: no cover
     BacktestRunner = None  # type: ignore
 
+try:  # pragma: no cover - optional dependency
+    from strategies import STRATEGY_REGISTRY as APP_STRATEGIES
+except Exception:  # pragma: no cover
+    APP_STRATEGIES = {}
+
 
 @dataclass(slots=True)
 class SimpleBacktestRunner:
@@ -120,6 +125,62 @@ class SimpleBacktestRunner:
         close = data["Close"].astype(float)
         returns = close.pct_change().fillna(0)
         return _align_equity_index((1 + returns).cumprod(), data)
+
+
+@dataclass(slots=True)
+class TradingStrategyRunner:
+    """Adapter that reuses the app's strategy definitions with backtesting.py."""
+
+    risk_engine: RiskEngine
+
+    def run(self, strategy_id: str, params: Dict[str, Any], data: pd.DataFrame) -> Metrics:
+        definition = APP_STRATEGIES.get(strategy_id)
+        if definition is None:
+            return SimpleBacktestRunner(self.risk_engine).run(strategy_id, params, data)
+
+        from backtesting import Backtest  # local import to avoid hard dependency in tests
+
+        base_params = dict(definition.default_params or {})
+        base_params.update(params or {})
+
+        frame = data.copy()
+        if "Timestamp" in frame.columns:
+            frame["Timestamp"] = pd.to_datetime(frame["Timestamp"], utc=True)
+            frame = frame.set_index("Timestamp")
+        elif not isinstance(frame.index, pd.DatetimeIndex):
+            frame.index = pd.to_datetime(frame.index, utc=True)
+
+        prepared = definition.prepare_data(frame, base_params)
+        signals = definition.generate_signals(prepared, base_params)
+        builder = definition.build_simple_backtest_strategy
+        if builder is None:
+            raise ValueError(f"Strategy '{strategy_id}' does not support simple backtests")
+
+        strat_cls = builder(prepared, signals, base_params)
+
+        cash = float(base_params.get("initial_cash", 10_000.0))
+        commission = float(base_params.get("fee_percent", 0.0)) / 100.0
+        slippage = float(base_params.get("slippage_percent", 0.0)) / 100.0
+
+        bt = Backtest(
+            prepared,
+            strat_cls,
+            cash=cash,
+            commission=commission,
+            slippage=slippage,
+            trade_on_close=False,
+            hedging=True,
+            exclusive_orders=False,
+        )
+
+        stats = bt.run()
+        equity_curve = stats["_equity_curve"]["Equity"].copy()
+        equity_curve.index = pd.to_datetime(equity_curve.index, utc=True)
+        managed_equity = self.risk_engine.enforce(equity_curve)
+
+        metrics_frame = prepared.reset_index().rename(columns={"index": "Timestamp"})
+        metrics_frame["Timestamp"] = pd.to_datetime(metrics_frame["Timestamp"], utc=True)
+        return _metrics_from_equity(managed_equity, metrics_frame)
 
 
 def _true_range(data: pd.DataFrame) -> pd.Series:
@@ -217,13 +278,12 @@ class BacktestService:
             if BacktestRunner is not None:
                 self.runner = BacktestRunner()
             else:
-                self.runner = SimpleBacktestRunner(self.risk_engine)
+                self.runner = TradingStrategyRunner(self.risk_engine)
 
     def run(self, strategy_id: str, params: Dict[str, Any], data: pd.DataFrame) -> Metrics:
         LOGGER.info("Running backtest for %s", strategy_id)
-        if isinstance(self.runner, SimpleBacktestRunner):
-            return self.runner.run(strategy_id, params, data)
-        result = self.runner.run(strategy_id=strategy_id, params=params, data=data)
+        runner = self.runner or TradingStrategyRunner(self.risk_engine)
+        result = runner.run(strategy_id=strategy_id, params=params, data=data)
         if isinstance(result, Metrics):
             return result
         return Metrics.parse_obj(result)

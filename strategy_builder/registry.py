@@ -4,7 +4,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Mapping, MutableMapping, Type
 
-from .pydantic_shim import BaseModel
+from strategies import STRATEGY_REGISTRY as APP_STRATEGIES
+from strategies import StrategyDefinition
+
+from .pydantic_shim import BaseModel, Field, create_model
 
 from . import __version__
 from .schemas import BreakoutPullbackParams, RegimeParams, TrendATRParams
@@ -25,6 +28,18 @@ class StrategyRegistry:
         self._bootstrap()
 
     def _bootstrap(self) -> None:
+        self._register_legacy_strategies()
+        for strategy_id, definition in APP_STRATEGIES.items():
+            if strategy_id in self._registry:
+                continue
+            try:
+                schema, bounds = _model_from_definition(definition)
+            except Exception:
+                # Skip strategies that cannot be adapted into schema form.
+                continue
+            self.register(strategy_id, schema, bounds, definition.__module__)
+
+    def _register_legacy_strategies(self) -> None:
         self.register(
             "trend_atr",
             TrendATRParams,
@@ -113,3 +128,49 @@ class StrategyRegistry:
 
 def get_registry() -> StrategyRegistry:
     return StrategyRegistry()
+
+
+def _model_from_definition(
+    definition: StrategyDefinition,
+) -> tuple[Type[BaseModel], Dict[str, tuple[float, float]]]:
+    controls = definition.controls or {}
+    defaults = dict(definition.default_params or {})
+    fields: Dict[str, tuple[type, Any]] = {}
+    bounds: Dict[str, tuple[float, float]] = {}
+
+    for name, spec in controls.items():
+        dtype = spec.get("dtype", float)
+        if dtype in {bool, str}:
+            # Skip non-numeric controls for the optimizer schema.
+            continue
+        annotation: type = float
+        if dtype in {int}:
+            annotation = int
+        default = defaults.get(name, spec.get("value"))
+        if default is None:
+            default = 0
+        field_kwargs: Dict[str, Any] = {}
+        if spec.get("min") is not None:
+            field_kwargs["ge"] = spec["min"]
+        if spec.get("max") is not None:
+            field_kwargs["le"] = spec["max"]
+        fields[name] = (annotation, Field(default=default, **field_kwargs))
+        bounds[name] = _bounds_from_spec(spec, float(default))
+
+    if not fields:
+        # Provide at least one numeric parameter so prompts remain valid.
+        fields["tuning_factor"] = (float, Field(default=1.0, ge=0.0, le=5.0))
+        bounds["tuning_factor"] = (0.0, 5.0)
+
+    model_name = f"{definition.key.title().replace('_', '')}Params"
+    model = create_model(model_name, **fields)  # type: ignore[arg-type]
+    return model, bounds
+
+
+def _bounds_from_spec(spec: Mapping[str, Any], default: float) -> tuple[float, float]:
+    min_value = spec.get("min")
+    max_value = spec.get("max")
+    if min_value is not None and max_value is not None:
+        return float(min_value), float(max_value)
+    spread = max(abs(default) * 0.5, 1.0)
+    return float(default - spread), float(default + spread)
