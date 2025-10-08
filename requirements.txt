@@ -7,3 +7,4 @@ backtesting==0.3.3
 backtrader>=1.9.78.123
 plotly>=5.22
 pytest>=7.0
+openai>=1.30
