@@ -1,16 +1,32 @@
 from __future__ import annotations
 
+import gzip
+import io
+import logging
 import math
+import os
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Optional
+from urllib import request as urllib_request
+from urllib.error import HTTPError, URLError
 
 try:  # pragma: no cover - optional dependency
     import ccxt  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
     ccxt = None  # type: ignore
 import pandas as pd
+
+
+_LOGGER = logging.getLogger(__name__)
+
+_DATASET_BASE_ENV = "KRAKEN_DATASET_BASE_URL"
+_DATASET_BASE_CANDIDATES = (
+    "https://datasets.kraken.com/spot/ohlc",
+    "https://download.kraken.com/spot/ohlc",
+    "https://data.kraken.com/ohlc",
+)
 
 
 @dataclass(slots=True)
@@ -70,6 +86,149 @@ def _ensure_ccxt() -> "ccxt":
     if ccxt is None:
         raise MissingCcxtError("ccxt is required for live exchange operations. Install it with `pip install ccxt`.")
     return ccxt
+
+
+def _dataset_base_urls() -> list[str]:
+    env_value = os.environ.get(_DATASET_BASE_ENV, "").strip()
+    bases: list[str] = []
+    if env_value:
+        bases.append(env_value.rstrip("/"))
+    for candidate in _DATASET_BASE_CANDIDATES:
+        if candidate not in bases:
+            bases.append(candidate)
+    return bases
+
+
+def _normalize_dataset_asset(asset: str) -> str:
+    cleaned = asset.upper().strip()
+    # Kraken prefixes some assets with X/Z. Strip them while retaining stablecoin suffixes.
+    while len(cleaned) > 3 and cleaned[0] in {"X", "Z"}:
+        cleaned = cleaned[1:]
+    if cleaned.startswith("XBT"):
+        cleaned = "BTC" + cleaned[3:]
+    return cleaned
+
+
+def _dataset_pair(symbol: str) -> tuple[str, str]:
+    if "/" in symbol:
+        base, quote = symbol.split("/", 1)
+    else:
+        midpoint = len(symbol) // 2
+        base, quote = symbol[:midpoint], symbol[midpoint:]
+    return _normalize_dataset_asset(base), _normalize_dataset_asset(quote)
+
+
+def _fetch_dataset_dataframe(url: str) -> Optional[pd.DataFrame]:
+    try:
+        req = urllib_request.Request(url, headers={"User-Agent": "ai-trader/ohlcv-fetcher"})
+        with urllib_request.urlopen(req, timeout=30) as resp:
+            payload = resp.read()
+    except (URLError, HTTPError) as exc:  # pragma: no cover - network dependent
+        _LOGGER.debug("Failed to download Kraken dataset from %s: %s", url, exc)
+        return None
+    except Exception as exc:  # pragma: no cover - network dependent
+        _LOGGER.debug("Unexpected error downloading Kraken dataset %s: %s", url, exc)
+        return None
+
+    if url.endswith(".gz"):
+        try:
+            with gzip.GzipFile(fileobj=io.BytesIO(payload)) as gz:
+                payload = gz.read()
+        except OSError as exc:
+            _LOGGER.debug("Failed to decompress Kraken dataset %s: %s", url, exc)
+            return None
+
+    try:
+        df = pd.read_csv(io.BytesIO(payload))
+    except Exception as exc:  # pragma: no cover - depends on dataset format
+        _LOGGER.debug("Failed to parse Kraken dataset CSV %s: %s", url, exc)
+        return None
+
+    return df
+
+
+def _kraken_dataset_rows(
+    symbol: str,
+    timeframe: str,
+    since_ms: int,
+    target_end_ms: int,
+    tolerance_ms: int,
+) -> list[list[float]]:
+    base, quote = _dataset_pair(symbol)
+    frame_key = timeframe.lower()
+    file_stems = [
+        f"{base}-{quote}_{frame_key}",
+        f"{base}_{quote}_{frame_key}",
+        f"{base}{quote}_{frame_key}",
+    ]
+    extensions = [".csv.gz", ".csv"]
+
+    for base_url in _dataset_base_urls():
+        base_url = base_url.rstrip("/")
+        for stem in file_stems:
+            for ext in extensions:
+                url = f"{base_url}/{base}/{quote}/{frame_key}/{stem}{ext}"
+                df = _fetch_dataset_dataframe(url)
+                if df is None or df.empty:
+                    continue
+
+                normalized_cols = {str(col).strip().lower(): col for col in df.columns}
+                time_col = normalized_cols.get("time") or normalized_cols.get("timestamp")
+                open_col = normalized_cols.get("open")
+                high_col = normalized_cols.get("high")
+                low_col = normalized_cols.get("low")
+                close_col = normalized_cols.get("close")
+                volume_col = normalized_cols.get("volume")
+
+                if not all([time_col, open_col, high_col, low_col, close_col]):
+                    continue
+
+                volume_series = df[volume_col] if volume_col else None
+
+                try:
+                    timestamps = pd.to_datetime(df[time_col], utc=True)
+                except Exception:
+                    try:
+                        timestamps = pd.to_datetime(df[time_col], unit="s", utc=True)
+                    except Exception:
+                        continue
+
+                values = []
+                lower_bound = pd.to_datetime(max(since_ms - tolerance_ms, 0), unit="ms", utc=True)
+                upper_bound = pd.to_datetime(target_end_ms + tolerance_ms, unit="ms", utc=True)
+                for idx, ts in enumerate(timestamps):
+                    if pd.isna(ts):
+                        continue
+                    if ts < lower_bound or ts > upper_bound:
+                        continue
+                    try:
+                        open_v = float(df.iloc[idx][open_col])
+                        high_v = float(df.iloc[idx][high_col])
+                        low_v = float(df.iloc[idx][low_col])
+                        close_v = float(df.iloc[idx][close_col])
+                        volume_v = float(volume_series.iloc[idx]) if volume_series is not None else 0.0
+                    except Exception:
+                        continue
+                    values.append([
+                        int(ts.timestamp() * 1000),
+                        open_v,
+                        high_v,
+                        low_v,
+                        close_v,
+                        volume_v,
+                    ])
+
+                if values:
+                    _LOGGER.info(
+                        "Loaded %s rows from Kraken dataset %s for %s %s",
+                        len(values),
+                        url,
+                        symbol,
+                        timeframe,
+                    )
+                    return values
+
+    return []
 
 
 def _parse8601(value: str) -> Optional[int]:
@@ -451,6 +610,11 @@ def fetch_ohlcv(
     if max_ts is not None and max_ts + tolerance_ms < target_end_ms and not _has_target_coverage():
         start_cursor = since_ms if max_ts is None else max(max_ts + timeframe_ms, since_ms)
         pages_used = _forward_paginate(start_cursor, pages_used)
+
+    if not _has_target_coverage():
+        dataset_rows = _kraken_dataset_rows(sym, timeframe, since_ms, target_end_ms, tolerance_ms)
+        if dataset_rows:
+            _ingest_chunk(dataset_rows)
 
     unique_rows = len(all_rows)
     if pages_hint <= 0 and unique_rows:

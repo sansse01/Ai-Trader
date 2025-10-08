@@ -219,3 +219,47 @@ def test_fetch_ohlcv_uses_ccxt_pagination_when_available(monkeypatch):
     assert params.get("paginationCalls") == expected_calls
     assert params.get("until") == end_ms
     assert fake_exchange.public_calls == []
+
+
+def test_fetch_ohlcv_downloads_dataset_when_api_history_is_short(monkeypatch):
+    frame_ms = 60 * 60 * 1000
+    # The exchange only exposes the latest 30 days.
+    exchange_rows = 30 * 24
+    start_ms = 0
+    end_ms = start_ms + 120 * 24 * frame_ms
+
+    fake_exchange = LateChunkKrakenExchange(start_ms=start_ms, rows=exchange_rows, frame_ms=frame_ms)
+    fake_module = types.SimpleNamespace(
+        kraken=lambda: fake_exchange,
+        Exchange=_FakeExchangeNamespace(timeframe_seconds=frame_ms // 1000),
+        RateLimitExceeded=Exception,
+    )
+    monkeypatch.setattr(fetcher, "ccxt", fake_module)
+
+    dataset_rows: list[list[float]] = []
+    dataset_hours = 120 * 24
+    for idx in range(dataset_hours):
+        ts = start_ms + idx * frame_ms
+        dataset_rows.append([ts, 1.0, 2.0, 0.5, 1.5, 25.0])
+
+    calls: list[tuple] = []
+
+    def fake_dataset(symbol, timeframe, since_ms, target_end_ms, tolerance_ms):
+        calls.append((symbol, timeframe, since_ms, target_end_ms, tolerance_ms))
+        return dataset_rows
+
+    monkeypatch.setattr(fetcher, "_kraken_dataset_rows", fake_dataset)
+
+    result = fetcher.fetch_ohlcv(
+        symbol="BTC/EUR",
+        timeframe="1h",
+        since_ms=start_ms,
+        target_end_ms=end_ms,
+        limit_per_page=720,
+    )
+
+    assert calls, "dataset fallback should be triggered"
+    assert result.rows == dataset_hours
+    assert result.reached_target is True
+    assert result.coverage is not None
+    assert result.coverage >= pd.Timedelta(days=120) - pd.Timedelta(milliseconds=frame_ms)
