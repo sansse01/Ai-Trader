@@ -159,15 +159,15 @@ class TradingStrategyRunner:
         strat_cls = builder(prepared, signals, base_params)
 
         cash = float(base_params.get("initial_cash", 10_000.0))
-        commission = float(base_params.get("fee_percent", 0.0)) / 100.0
-        slippage = float(base_params.get("slippage_percent", 0.0)) / 100.0
+        fee_percent = float(base_params.get("fee_percent", 0.0))
+        slippage_percent = float(base_params.get("slippage_percent", 0.0))
+        commission = (fee_percent + slippage_percent) / 100.0
 
         bt = Backtest(
             prepared,
             strat_cls,
             cash=cash,
             commission=commission,
-            slippage=slippage,
             trade_on_close=False,
             hedging=True,
             exclusive_orders=False,
