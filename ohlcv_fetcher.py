@@ -180,6 +180,11 @@ def fetch_ohlcv(
     pages_used = 0
     pages_hint = 0
 
+    def _estimate_pages(row_count: int) -> int:
+        if row_count <= 0:
+            return 0
+        return math.ceil(row_count / max(limit_per_page, 1))
+
     def _update_bounds(ts: int) -> None:
         nonlocal min_ts, max_ts
         if min_ts is None or ts < min_ts:
@@ -228,15 +233,36 @@ def fetch_ohlcv(
                 newest = ts
         return added, newest
 
-    first_chunk = _fetch_chunk(since_ms)
-    pages_hint = 0
-    if first_chunk is not None:
-        pages_used += 1
-        added, newest = _ingest_chunk(first_chunk)
-        if added and newest is not None:
-            pages_hint = 1
-        elif first_chunk:
-            pages_hint = 1
+    if limit_per_page > 0:
+        auto_calls = max(1, min(page_budget, 200))
+        auto_params = {"paginate": True, "paginationCalls": auto_calls, "until": target_end_ms}
+        try:
+            auto_rows = ex.fetch_ohlcv(
+                sym,
+                timeframe,
+                since=int(since_ms),
+                limit=limit_per_page,
+                params=auto_params,
+            )
+        except Exception:
+            auto_rows = []
+
+        if auto_rows:
+            estimated = _estimate_pages(len(auto_rows))
+            if estimated:
+                pages_hint = max(pages_hint, estimated)
+                pages_used = max(pages_used, min(page_budget, estimated))
+            _ingest_chunk(auto_rows)
+
+    if not _has_target_coverage():
+        first_chunk = _fetch_chunk(since_ms)
+        if first_chunk is not None:
+            pages_used += 1
+            added, newest = _ingest_chunk(first_chunk)
+            if added and newest is not None:
+                pages_hint = max(pages_hint, 1)
+            elif first_chunk:
+                pages_hint = max(pages_hint, 1)
 
     def _forward_paginate(start_cursor: int, pages_so_far: int) -> int:
         cursor = start_cursor

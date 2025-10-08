@@ -22,12 +22,18 @@ class FakeKrakenExchange:
         self.rows = rows
         self.frame_ms = frame_ms
         self.market = {"BTC/EUR": {}}
+        self.calls: list[dict[str, object]] = []
 
     def load_markets(self):
         return self.market
 
     def fetch_ohlcv(self, symbol, timeframe, since=None, limit=None, params=None):
         limit = limit or 720
+        self.calls.append({
+            "params": params or {},
+            "since": since,
+            "limit": limit,
+        })
         # Simulate ccxt's built-in paginator returning only the first chunk.
         if params and params.get("paginate"):
             count = min(limit, self.rows)
@@ -61,6 +67,21 @@ class LateChunkKrakenExchange(FakeKrakenExchange):
             return [self._build_row(start_idx + i) for i in range(count)]
 
         return super().fetch_ohlcv(symbol, timeframe, since=since, limit=limit, params=params)
+
+
+class AutoPagingKrakenExchange(FakeKrakenExchange):
+    """Exchange that fulfils the request entirely via ccxt pagination."""
+
+    def fetch_ohlcv(self, symbol, timeframe, since=None, limit=None, params=None):
+        limit = limit or 720
+        self.calls.append({
+            "params": params or {},
+            "since": since,
+            "limit": limit,
+        })
+        if params and params.get("paginate"):
+            return [self._build_row(i) for i in range(self.rows)]
+        pytest.fail("Manual pagination should not be triggered when auto pagination succeeds")
 
 
 def test_fetch_ohlcv_falls_back_to_manual_pagination(monkeypatch):
@@ -119,3 +140,36 @@ def test_fetch_ohlcv_backfills_when_initial_window_is_recent(monkeypatch):
     assert result.start == pd.to_datetime(start_ms, unit="ms", utc=True)
     expected_end = pd.to_datetime(end_ms - frame_ms, unit="ms", utc=True)
     assert result.end == expected_end
+
+
+def test_fetch_ohlcv_uses_ccxt_pagination_when_available(monkeypatch):
+    hours = 90 * 24
+    frame_ms = 60 * 60 * 1000
+    start_ms = 0
+    end_ms = start_ms + hours * frame_ms
+
+    fake_exchange = AutoPagingKrakenExchange(start_ms=start_ms, rows=hours, frame_ms=frame_ms)
+    fake_module = types.SimpleNamespace(
+        kraken=lambda: fake_exchange,
+        Exchange=_FakeExchangeNamespace(timeframe_seconds=frame_ms // 1000),
+        RateLimitExceeded=Exception,
+    )
+    monkeypatch.setattr(fetcher, "ccxt", fake_module)
+
+    result = fetcher.fetch_ohlcv(
+        symbol="BTC/EUR",
+        timeframe="1h",
+        since_ms=start_ms,
+        target_end_ms=end_ms,
+        limit_per_page=720,
+    )
+
+    assert result.rows == hours
+    assert result.reached_target is True
+    assert len(fake_exchange.calls) == 1
+    params = fake_exchange.calls[0]["params"]
+    assert isinstance(params, dict)
+    assert params.get("paginate") is True
+    expected_calls = max(1, min(result.max_pages, 200))
+    assert params.get("paginationCalls") == expected_calls
+    assert params.get("until") == end_ms
