@@ -296,7 +296,7 @@ def fetch_ohlcv(
         if min_ts is None:
             return pages_so_far
 
-        cursor = max(min_ts - chunk_span_ms, 0)
+        cursor = max(min_ts - chunk_span_ms, since_ms)
         idle = 0
         max_idle = 3
         while pages_so_far < page_budget and cursor + tolerance_ms >= since_ms:
@@ -304,28 +304,28 @@ def fetch_ohlcv(
             if chunk is None:
                 idle += 1
                 if idle >= max_idle:
-                    if cursor <= 0:
+                    if cursor <= since_ms:
                         break
-                    cursor = max(cursor - max(chunk_span_ms, timeframe_ms), 0)
+                    cursor = max(cursor - max(chunk_span_ms, timeframe_ms), since_ms)
                     idle = 0
                 else:
-                    cursor = max(cursor - timeframe_ms, 0)
+                    cursor = max(cursor - timeframe_ms, since_ms)
                 continue
 
             pages_so_far += 1
             added, _ = _ingest_chunk(chunk)
             if added:
-                cursor = max((min_ts or since_ms) - chunk_span_ms, 0)
+                cursor = max((min_ts or since_ms) - chunk_span_ms, since_ms)
                 idle = 0
             else:
                 idle += 1
                 if idle >= max_idle:
-                    if cursor <= 0:
+                    if cursor <= since_ms:
                         break
-                    cursor = max(cursor - max(chunk_span_ms, timeframe_ms), 0)
+                    cursor = max(cursor - max(chunk_span_ms, timeframe_ms), since_ms)
                     idle = 0
                 else:
-                    cursor = max(cursor - timeframe_ms, 0)
+                    cursor = max(cursor - timeframe_ms, since_ms)
 
             if _has_target_coverage():
                 break
@@ -334,14 +334,14 @@ def fetch_ohlcv(
 
         return pages_so_far
 
-    if not _has_target_coverage():
+    if max_ts is None or max_ts + tolerance_ms < target_end_ms:
         start_cursor = since_ms if max_ts is None else max(max_ts + timeframe_ms, since_ms)
         pages_used = _forward_paginate(start_cursor, pages_used)
 
     if not _has_target_coverage() and min_ts is not None and min_ts > since_ms + tolerance_ms:
         pages_used = _backfill_paginate(pages_used)
 
-    if not _has_target_coverage():
+    if max_ts is not None and max_ts + tolerance_ms < target_end_ms and not _has_target_coverage():
         start_cursor = since_ms if max_ts is None else max(max_ts + timeframe_ms, since_ms)
         pages_used = _forward_paginate(start_cursor, pages_used)
 
