@@ -21,8 +21,8 @@ pip install -r requirements.txt  # ensure pandas, pydantic, numpy, pyyaml
   export OPENAI_API_KEY="sk-..."
   ```
 * By default the optimizer targets the `gpt-5` API alias (system card
-  `gpt-5-thinking`) with JSON mode, `medium` reasoning effort, `medium`
-  verbosity, and `2048` max output tokens. Override via CLI flags (`--model`,
+  `gpt-5-thinking`) with JSON mode and relies on the API defaults for reasoning
+  effort, verbosity, and output tokens. Override via CLI flags (`--model`,
   `--reasoning-effort`, `--verbosity`, `--max-output-tokens`, or
   `--temperature` for pre GPT-5 models) or by editing
   `strategy_builder/configs/optimizer_defaults.yaml`.

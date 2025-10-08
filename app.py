@@ -79,23 +79,58 @@ def render_llm_controls(prefix: str) -> Tuple[str, Optional[float], Optional[str
     st.caption(GPT5_MODEL_CAPTION)
 
     if is_gpt5_model(model):
-        reasoning = st.selectbox(
+        reasoning_key = f"{prefix}_reasoning"
+        current_reasoning = st.session_state.get(reasoning_key)
+        if isinstance(current_reasoning, str) and current_reasoning in {"minimal", "low", "medium", "high"}:
+            st.session_state[reasoning_key] = current_reasoning.capitalize()
+        reasoning_option = st.selectbox(
             "Reasoning effort",
-            ["minimal", "low", "medium", "high"],
-            index=2,
-            key=f"{prefix}_reasoning",
+            [
+                "Use model default",
+                "Minimal",
+                "Low",
+                "Medium",
+                "High",
+            ],
+            index=0,
+            key=reasoning_key,
         )
-        verbosity = st.selectbox(
+        reasoning_map = {
+            "Use model default": None,
+            "Minimal": "minimal",
+            "Low": "low",
+            "Medium": "medium",
+            "High": "high",
+        }
+        reasoning = reasoning_map[reasoning_option]
+
+        verbosity_key = f"{prefix}_verbosity"
+        current_verbosity = st.session_state.get(verbosity_key)
+        if isinstance(current_verbosity, str) and current_verbosity in {"low", "medium", "high"}:
+            st.session_state[verbosity_key] = current_verbosity.capitalize()
+        verbosity_option = st.selectbox(
             "Response verbosity",
-            ["low", "medium", "high"],
-            index=1,
-            key=f"{prefix}_verbosity",
+            [
+                "Use model default",
+                "Low",
+                "Medium",
+                "High",
+            ],
+            index=0,
+            key=verbosity_key,
         )
+        verbosity_map = {
+            "Use model default": None,
+            "Low": "low",
+            "Medium": "medium",
+            "High": "high",
+        }
+        verbosity = verbosity_map[verbosity_option]
         max_tokens_raw = st.number_input(
             "Max output tokens (0 uses the API default)",
             min_value=0,
             max_value=8192,
-            value=2048,
+            value=0,
             step=128,
             key=f"{prefix}_max_tokens",
         )

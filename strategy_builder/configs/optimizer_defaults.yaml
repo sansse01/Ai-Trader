@@ -1,8 +1,8 @@
 model: gpt-5
 temperature: null
-reasoning_effort: medium
-verbosity: medium
-max_output_tokens: 2048
+reasoning_effort: null
+verbosity: null
+max_output_tokens: null
 proposal_count: 8
 tolerances:
   cagr: 0.08
