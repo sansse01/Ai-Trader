@@ -8,6 +8,7 @@ import pytest
 
 from strategy_builder.datasvc import DataService
 from strategy_builder.llm_optimizer import LLMOptimizer
+import strategy_builder.llm_optimizer as llm_optimizer
 from strategy_builder.registry import StrategyRegistry
 from strategy_builder.schemas import OptimizeResponse
 
@@ -66,3 +67,16 @@ def test_optimizer_failure_after_retries(tmp_path: Path) -> None:
     optimizer._call_llm = lambda prompt: "{"  # type: ignore[assignment]
     with pytest.raises(RuntimeError):
         optimizer.optimize("trend_atr", "1h", sample_summary(), n=1)
+
+
+def test_optimizer_without_api_key(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    registry = StrategyRegistry()
+    data_service = DataService(cache_dir=tmp_path)
+
+    class RaisingClient:
+        def __init__(self) -> None:
+            raise RuntimeError("missing api key")
+
+    monkeypatch.setattr(llm_optimizer, "OpenAI", RaisingClient)
+    optimizer = LLMOptimizer(registry, data_service, tmp_path)
+    assert optimizer.client is None

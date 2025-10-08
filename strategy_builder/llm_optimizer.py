@@ -38,7 +38,7 @@ class LLMOptimizer:
         self.registry = registry
         self.data_service = data_service
         self.prompt_dir = prompt_dir
-        self.client = client or (OpenAI() if OpenAI else None)
+        self.client = client or self._build_default_client()
         self.model = model.strip()
         self.temperature = temperature
         self.reasoning_effort = reasoning_effort
@@ -46,7 +46,9 @@ class LLMOptimizer:
         self.max_output_tokens = max_output_tokens
         self.max_retries = max_retries
         if self.client is None:
-            LOGGER.warning("OpenAI client not available; optimizer will require injection during tests.")
+            LOGGER.warning(
+                "OpenAI client unavailable; provide a client instance or set OPENAI_API_KEY when running live optimizations."
+            )
 
     def optimize(
         self,
@@ -124,3 +126,12 @@ class LLMOptimizer:
 
     def _is_gpt5_model(self) -> bool:
         return self.model.lower().startswith("gpt-5")
+
+    def _build_default_client(self) -> Any | None:
+        if OpenAI is None:
+            return None
+        try:
+            return OpenAI()
+        except Exception as exc:  # pragma: no cover - exercised via unit tests
+            LOGGER.warning("Failed to initialise OpenAI client: %s", exc)
+            return None
