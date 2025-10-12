@@ -4,7 +4,11 @@ import math
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Optional
+from urllib.request import urlretrieve
+import zipfile
+from io import BytesIO
 
 import ccxt
 import pandas as pd
@@ -46,6 +50,191 @@ class OHLCVFetchResult:
     @property
     def truncated(self) -> bool:
         return not self.reached_target
+
+
+_KRAKEN_DATASET_URL = "https://data.kraken.com/ohlc.zip"
+_KRAKEN_ZIP_FILENAME = "kraken_ohlc.zip"
+_KRAKEN_CACHE_FILENAME = "ohlcv.csv"
+_KRAKEN_ZIP_MAX_AGE = timedelta(hours=6)
+_KRAKEN_DATASET_MAX_AGE = timedelta(hours=6)
+_CACHE_DIRNAME = Path("data/kraken_cache")
+_OHLC_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
+
+
+def _kraken_cache_root(cache_root: Optional[Path] = None) -> Path:
+    if cache_root is not None:
+        return Path(cache_root).expanduser().resolve()
+    return (Path(__file__).resolve().parent / _CACHE_DIRNAME).resolve()
+
+
+def _symbol_to_cache_pair(symbol: str) -> str:
+    return symbol.replace("/", "").replace(" ", "").upper()
+
+
+def _cache_dataset_path(symbol: str, timeframe: str, cache_root: Path) -> Path:
+    pair = _symbol_to_cache_pair(symbol)
+    return cache_root / pair / timeframe / _KRAKEN_CACHE_FILENAME
+
+
+def _is_stale(path: Path, max_age: timedelta) -> bool:
+    if not path.exists():
+        return True
+    try:
+        modified = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
+    except (OSError, ValueError):
+        return True
+    return datetime.now(UTC) - modified > max_age
+
+
+def _download_kraken_zip(cache_root: Path) -> Optional[Path]:
+    zip_path = cache_root / _KRAKEN_ZIP_FILENAME
+    if zip_path.exists() and not _is_stale(zip_path, _KRAKEN_ZIP_MAX_AGE):
+        return zip_path
+
+    cache_root.mkdir(parents=True, exist_ok=True)
+    tmp_path = zip_path.with_suffix(".tmp")
+    try:
+        urlretrieve(_KRAKEN_DATASET_URL, tmp_path)
+        tmp_path.replace(zip_path)
+        return zip_path
+    except Exception:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+        if zip_path.exists():
+            return zip_path
+    return None
+
+
+def _read_dataset_from_stream(stream: BytesIO) -> pd.DataFrame:
+    try:
+        df = pd.read_csv(stream)
+    except Exception:
+        return pd.DataFrame(columns=_OHLC_COLUMNS)
+
+    if df.empty:
+        return pd.DataFrame(columns=_OHLC_COLUMNS)
+
+    lower_cols = {col.lower(): col for col in df.columns}
+    time_col = lower_cols.get("time")
+    if time_col is None:
+        return pd.DataFrame(columns=_OHLC_COLUMNS)
+
+    ts = pd.to_datetime(df[time_col], unit="s", utc=True, errors="coerce")
+    frame = pd.DataFrame(index=ts)
+    frame.index.name = "Timestamp"
+
+    for col in _OHLC_COLUMNS:
+        source_col = lower_cols.get(col.lower())
+        if source_col is None:
+            frame[col] = 0.0
+        else:
+            frame[col] = pd.to_numeric(df[source_col], errors="coerce").fillna(0.0)
+
+    frame = frame[~frame.index.isna()]
+    if frame.empty:
+        return pd.DataFrame(columns=_OHLC_COLUMNS)
+    frame = frame.sort_index()
+    frame = frame[~frame.index.duplicated(keep="last")]
+    return frame
+
+
+def _write_cached_dataset(symbol: str, timeframe: str, frame: pd.DataFrame, cache_root: Path) -> Path:
+    dest_path = _cache_dataset_path(symbol, timeframe, cache_root)
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    if frame.empty:
+        if dest_path.exists():
+            try:
+                dest_path.unlink()
+            except OSError:
+                pass
+        return dest_path
+
+    ordered = frame.sort_index()
+    for col in _OHLC_COLUMNS:
+        if col not in ordered.columns:
+            ordered[col] = 0.0
+    ordered = ordered[_OHLC_COLUMNS]
+    to_write = ordered.reset_index()
+    to_write["Timestamp"] = to_write["Timestamp"].dt.tz_convert("UTC")
+    to_write.to_csv(dest_path, index=False)
+    return dest_path
+
+
+def _read_cached_dataset(symbol: str, timeframe: str, cache_root: Path) -> pd.DataFrame:
+    path = _cache_dataset_path(symbol, timeframe, cache_root)
+    if not path.exists():
+        return pd.DataFrame(columns=_OHLC_COLUMNS)
+    try:
+        df = pd.read_csv(path, parse_dates=["Timestamp"])
+    except Exception:
+        return pd.DataFrame(columns=_OHLC_COLUMNS)
+    if df.empty or "Timestamp" not in df:
+        return pd.DataFrame(columns=_OHLC_COLUMNS)
+    ts = pd.to_datetime(df["Timestamp"], utc=True, errors="coerce")
+    frame = df.assign(Timestamp=ts).dropna(subset=["Timestamp"]).set_index("Timestamp")
+    for col in _OHLC_COLUMNS:
+        if col not in frame.columns:
+            frame[col] = 0.0
+    frame = frame[_OHLC_COLUMNS]
+    frame.index = frame.index.tz_convert("UTC")
+    frame = frame.sort_index()
+    frame = frame[~frame.index.duplicated(keep="last")]
+    return frame
+
+
+def _extract_kraken_dataset(zip_path: Path, symbol: str, timeframe: str, cache_root: Path) -> pd.DataFrame:
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            pair = _symbol_to_cache_pair(symbol)
+            pair_lower = pair.lower()
+            timeframe_name = f"{timeframe.lower()}.csv"
+            target_name: Optional[str] = None
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                parts = Path(info.filename).parts
+                if not parts:
+                    continue
+                filename = parts[-1].lower()
+                if filename != timeframe_name:
+                    continue
+                if any(part.lower() == pair_lower for part in parts):
+                    target_name = info.filename
+                    break
+            if target_name is None:
+                return pd.DataFrame(columns=_OHLC_COLUMNS)
+            with zf.open(target_name) as handle:
+                data = handle.read()
+    except Exception:
+        return pd.DataFrame(columns=_OHLC_COLUMNS)
+
+    frame = _read_dataset_from_stream(BytesIO(data))
+    _write_cached_dataset(symbol, timeframe, frame, cache_root)
+    return frame
+
+
+def _kraken_dataset_rows(
+    symbol: str,
+    timeframe: str,
+    cache_root: Optional[Path] = None,
+) -> pd.DataFrame:
+    root = _kraken_cache_root(cache_root)
+    cached = _read_cached_dataset(symbol, timeframe, root)
+    if not cached.empty and not _is_stale(_cache_dataset_path(symbol, timeframe, root), _KRAKEN_DATASET_MAX_AGE):
+        return cached
+
+    zip_path = _download_kraken_zip(root)
+    if zip_path is not None:
+        fresh = _extract_kraken_dataset(zip_path, symbol, timeframe, root)
+        if not fresh.empty:
+            return fresh
+
+    if not cached.empty:
+        return cached
+    return pd.DataFrame(columns=_OHLC_COLUMNS)
 
 
 def window_to_timedelta(window_value: int, window_unit: str) -> timedelta:
@@ -100,6 +289,7 @@ def fetch_ohlcv(
     since_ms: int,
     target_end_ms: Optional[int] = None,
     limit_per_page: int = 720,
+    cache_root: Optional[Path | str] = None,
 ) -> OHLCVFetchResult:
     ex = ccxt.kraken()
     sym = normalize_symbol(ex, symbol)
@@ -120,6 +310,15 @@ def fetch_ohlcv(
     page_budget = max(min(approx_pages + 5, 2400), 4)
 
     tolerance_ms = max(timeframe_ms, 60_000)
+    cache_root_path = _kraken_cache_root(cache_root)
+    dataset_symbol = sym
+    dataset_rows = _kraken_dataset_rows(sym, timeframe, cache_root_path)
+    if dataset_rows.empty and symbol != sym:
+        alt_rows = _kraken_dataset_rows(symbol, timeframe, cache_root_path)
+        if not alt_rows.empty:
+            dataset_rows = alt_rows
+            dataset_symbol = symbol
+
     params = {"paginate": True, "paginationCalls": page_budget}
     all_rows: list[list[float]] = []
     pages = 0
@@ -256,11 +455,46 @@ def fetch_ohlcv(
     requested_start = pd.to_datetime(since_ms, unit="ms", utc=True)
     requested_end = pd.to_datetime(target_end_ms, unit="ms", utc=True)
     target_coverage = pd.to_timedelta(desired_span_ms, unit="ms")
-    coverage = df.index.max() - df.index.min() if not df.empty else pd.Timedelta(0)
     tolerance = pd.to_timedelta(tolerance_ms, unit="ms")
+
+    combined_frames = []
+    if not dataset_rows.empty:
+        combined_frames.append(dataset_rows)
+    if not df.empty:
+        combined_frames.append(df)
+
+    if combined_frames:
+        combined_df = pd.concat(combined_frames).sort_index()
+    else:
+        combined_df = pd.DataFrame(columns=_OHLC_COLUMNS, index=pd.DatetimeIndex([], tz="UTC"))
+
+    if not combined_df.empty:
+        combined_df = combined_df[~combined_df.index.duplicated(keep="last")]
+        for col in _OHLC_COLUMNS:
+            if col not in combined_df.columns:
+                combined_df[col] = 0.0
+        combined_df = combined_df[_OHLC_COLUMNS]
+        _write_cached_dataset(dataset_symbol, timeframe, combined_df, cache_root_path)
+        if dataset_symbol != sym:
+            _write_cached_dataset(sym, timeframe, combined_df, cache_root_path)
+    else:
+        _write_cached_dataset(dataset_symbol, timeframe, combined_df, cache_root_path)
+        if dataset_symbol != sym:
+            _write_cached_dataset(sym, timeframe, combined_df, cache_root_path)
+
+    filtered_df = combined_df
+    if not filtered_df.empty:
+        upper_bound = requested_end + tolerance
+        filtered_df = filtered_df.loc[(filtered_df.index >= requested_start) & (filtered_df.index <= upper_bound)]
+
+    coverage = (
+        filtered_df.index.max() - filtered_df.index.min()
+        if not filtered_df.empty
+        else pd.Timedelta(0)
+    )
     reached_target = desired_span_ms <= 0 or coverage + tolerance >= target_coverage
     return OHLCVFetchResult(
-        df,
+        filtered_df,
         pages=pages,
         limit_per_page=limit_per_page,
         max_pages=page_budget,
