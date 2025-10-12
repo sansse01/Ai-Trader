@@ -1,13 +1,32 @@
 from __future__ import annotations
 
+import gzip
+import io
+import logging
 import math
+import os
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Optional
+from urllib import request as urllib_request
+from urllib.error import HTTPError, URLError
 
-import ccxt
+try:  # pragma: no cover - optional dependency
+    import ccxt  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    ccxt = None  # type: ignore
 import pandas as pd
+
+
+_LOGGER = logging.getLogger(__name__)
+
+_DATASET_BASE_ENV = "KRAKEN_DATASET_BASE_URL"
+_DATASET_BASE_CANDIDATES = (
+    "https://datasets.kraken.com/spot/ohlc",
+    "https://download.kraken.com/spot/ohlc",
+    "https://data.kraken.com/ohlc",
+)
 
 
 @dataclass(slots=True)
@@ -59,10 +78,173 @@ def window_to_timedelta(window_value: int, window_unit: str) -> timedelta:
     return timedelta(days=window_value)
 
 
+class MissingCcxtError(RuntimeError):
+    """Raised when a ccxt-dependent feature is used without the library installed."""
+
+
+def _ensure_ccxt() -> "ccxt":
+    if ccxt is None:
+        raise MissingCcxtError("ccxt is required for live exchange operations. Install it with `pip install ccxt`.")
+    return ccxt
+
+
+def _dataset_base_urls() -> list[str]:
+    env_value = os.environ.get(_DATASET_BASE_ENV, "").strip()
+    bases: list[str] = []
+    if env_value:
+        bases.append(env_value.rstrip("/"))
+    for candidate in _DATASET_BASE_CANDIDATES:
+        if candidate not in bases:
+            bases.append(candidate)
+    return bases
+
+
+def _normalize_dataset_asset(asset: str) -> str:
+    cleaned = asset.upper().strip()
+    # Kraken prefixes some assets with X/Z. Strip them while retaining stablecoin suffixes.
+    while len(cleaned) > 3 and cleaned[0] in {"X", "Z"}:
+        cleaned = cleaned[1:]
+    if cleaned.startswith("XBT"):
+        cleaned = "BTC" + cleaned[3:]
+    return cleaned
+
+
+def _dataset_pair(symbol: str) -> tuple[str, str]:
+    if "/" in symbol:
+        base, quote = symbol.split("/", 1)
+    else:
+        midpoint = len(symbol) // 2
+        base, quote = symbol[:midpoint], symbol[midpoint:]
+    return _normalize_dataset_asset(base), _normalize_dataset_asset(quote)
+
+
+def _fetch_dataset_dataframe(url: str) -> Optional[pd.DataFrame]:
+    try:
+        req = urllib_request.Request(url, headers={"User-Agent": "ai-trader/ohlcv-fetcher"})
+        with urllib_request.urlopen(req, timeout=30) as resp:
+            payload = resp.read()
+    except (URLError, HTTPError) as exc:  # pragma: no cover - network dependent
+        _LOGGER.debug("Failed to download Kraken dataset from %s: %s", url, exc)
+        return None
+    except Exception as exc:  # pragma: no cover - network dependent
+        _LOGGER.debug("Unexpected error downloading Kraken dataset %s: %s", url, exc)
+        return None
+
+    if url.endswith(".gz"):
+        try:
+            with gzip.GzipFile(fileobj=io.BytesIO(payload)) as gz:
+                payload = gz.read()
+        except OSError as exc:
+            _LOGGER.debug("Failed to decompress Kraken dataset %s: %s", url, exc)
+            return None
+
+    try:
+        df = pd.read_csv(io.BytesIO(payload))
+    except Exception as exc:  # pragma: no cover - depends on dataset format
+        _LOGGER.debug("Failed to parse Kraken dataset CSV %s: %s", url, exc)
+        return None
+
+    return df
+
+
+def _kraken_dataset_rows(
+    symbol: str,
+    timeframe: str,
+    since_ms: int,
+    target_end_ms: int,
+    tolerance_ms: int,
+) -> list[list[float]]:
+    base, quote = _dataset_pair(symbol)
+    frame_key = timeframe.lower()
+    file_stems = [
+        f"{base}-{quote}_{frame_key}",
+        f"{base}_{quote}_{frame_key}",
+        f"{base}{quote}_{frame_key}",
+    ]
+    extensions = [".csv.gz", ".csv"]
+
+    for base_url in _dataset_base_urls():
+        base_url = base_url.rstrip("/")
+        for stem in file_stems:
+            for ext in extensions:
+                url = f"{base_url}/{base}/{quote}/{frame_key}/{stem}{ext}"
+                df = _fetch_dataset_dataframe(url)
+                if df is None or df.empty:
+                    continue
+
+                normalized_cols = {str(col).strip().lower(): col for col in df.columns}
+                time_col = normalized_cols.get("time") or normalized_cols.get("timestamp")
+                open_col = normalized_cols.get("open")
+                high_col = normalized_cols.get("high")
+                low_col = normalized_cols.get("low")
+                close_col = normalized_cols.get("close")
+                volume_col = normalized_cols.get("volume")
+
+                if not all([time_col, open_col, high_col, low_col, close_col]):
+                    continue
+
+                volume_series = df[volume_col] if volume_col else None
+
+                try:
+                    timestamps = pd.to_datetime(df[time_col], utc=True)
+                except Exception:
+                    try:
+                        timestamps = pd.to_datetime(df[time_col], unit="s", utc=True)
+                    except Exception:
+                        continue
+
+                values = []
+                lower_bound = pd.to_datetime(max(since_ms - tolerance_ms, 0), unit="ms", utc=True)
+                upper_bound = pd.to_datetime(target_end_ms + tolerance_ms, unit="ms", utc=True)
+                for idx, ts in enumerate(timestamps):
+                    if pd.isna(ts):
+                        continue
+                    if ts < lower_bound or ts > upper_bound:
+                        continue
+                    try:
+                        open_v = float(df.iloc[idx][open_col])
+                        high_v = float(df.iloc[idx][high_col])
+                        low_v = float(df.iloc[idx][low_col])
+                        close_v = float(df.iloc[idx][close_col])
+                        volume_v = float(volume_series.iloc[idx]) if volume_series is not None else 0.0
+                    except Exception:
+                        continue
+                    values.append([
+                        int(ts.timestamp() * 1000),
+                        open_v,
+                        high_v,
+                        low_v,
+                        close_v,
+                        volume_v,
+                    ])
+
+                if values:
+                    _LOGGER.info(
+                        "Loaded %s rows from Kraken dataset %s for %s %s",
+                        len(values),
+                        url,
+                        symbol,
+                        timeframe,
+                    )
+                    return values
+
+    return []
+
+
+def _parse8601(value: str) -> Optional[int]:
+    try:
+        ts = pd.to_datetime(value, utc=True)
+    except Exception:
+        return None
+    if pd.isna(ts):
+        return None
+    return int(ts.timestamp() * 1000)
+
+
 def resolve_since(window_value: int, window_unit: str, override: str = "") -> tuple[int, datetime, timedelta]:
     override_clean = (override or "").strip()
     if override_clean:
-        parsed = ccxt.kraken().parse8601(override_clean)
+        parsed = _parse8601(override_clean)
         if parsed is None:
             raise ValueError("Invalid 'Since' value. Use ISO8601 like 2022-01-01T00:00:00Z")
         dt = datetime.fromtimestamp(parsed / 1000.0, tz=UTC)
@@ -94,6 +276,25 @@ def normalize_symbol(exchange: "ccxt.Exchange", symbol: str) -> str:
     return symbol
 
 
+def _fallback_parse_timeframe(timeframe: str) -> int:
+    unit = timeframe[-1:].lower()
+    try:
+        value = float(timeframe[:-1] or 1)
+    except ValueError:
+        return 60
+    multipliers = {
+        "s": 1,
+        "m": 60,
+        "h": 60 * 60,
+        "d": 60 * 60 * 24,
+        "w": 60 * 60 * 24 * 7,
+    }
+    seconds = multipliers.get(unit)
+    if seconds is None:
+        return 60
+    return int(max(value * seconds, 1))
+
+
 def fetch_ohlcv(
     symbol: str,
     timeframe: str,
@@ -101,12 +302,21 @@ def fetch_ohlcv(
     target_end_ms: Optional[int] = None,
     limit_per_page: int = 720,
 ) -> OHLCVFetchResult:
-    ex = ccxt.kraken()
+    module = _ensure_ccxt()
+    if not hasattr(module, "kraken"):
+        raise MissingCcxtError("ccxt.kraken() is unavailable; ensure the exchange is supported by your ccxt build.")
+
+    ex = module.kraken()
     sym = normalize_symbol(ex, symbol)
-    try:
-        timeframe_seconds = ccxt.Exchange.parse_timeframe(timeframe)
-    except Exception:
-        timeframe_seconds = 60
+    timeframe_seconds = None
+    exchange_cls = getattr(module, "Exchange", None)
+    if exchange_cls is not None and hasattr(exchange_cls, "parse_timeframe"):
+        try:
+            timeframe_seconds = exchange_cls.parse_timeframe(timeframe)
+        except Exception:
+            timeframe_seconds = None
+    if timeframe_seconds is None:
+        timeframe_seconds = _fallback_parse_timeframe(timeframe)
     timeframe_ms = max(int(timeframe_seconds * 1000), 1)
 
     if target_end_ms is None:
@@ -120,109 +330,297 @@ def fetch_ohlcv(
     page_budget = max(min(approx_pages + 5, 2400), 4)
 
     tolerance_ms = max(timeframe_ms, 60_000)
-    params = {"paginate": True, "paginationCalls": page_budget}
-    all_rows: list[list[float]] = []
-    pages = 0
-    manual_attempted = False
+    rate_limit_exc = getattr(module, "RateLimitExceeded", Exception)
 
-    def _manual_fetch() -> tuple[list[list[float]], int]:
-        rows: list[list[float]] = []
-        seen_ts: set[int] = set()
-        cursor = since_ms
-        calls = 0
+    all_rows: list[list[float]] = []
+    seen_ts: set[int] = set()
+    min_ts: Optional[int] = None
+    max_ts: Optional[int] = None
+    pages_used = 0
+    pages_hint = 0
+
+    def _estimate_pages(row_count: int) -> int:
+        if row_count <= 0:
+            return 0
+        return math.ceil(row_count / max(limit_per_page, 1))
+
+    def _update_bounds(ts: int) -> None:
+        nonlocal min_ts, max_ts
+        if min_ts is None or ts < min_ts:
+            min_ts = ts
+        if max_ts is None or ts > max_ts:
+            max_ts = ts
+
+    def _has_target_coverage() -> bool:
+        if min_ts is None or max_ts is None:
+            return False
+        coverage_ms = max_ts - min_ts
+        return desired_span_ms <= 0 or coverage_ms + tolerance_ms >= desired_span_ms
+
+    market_id = sym
+    market_info = None
+    try:
+        market_info = ex.market(sym)
+        market_id = market_info.get("id", market_id)
+    except Exception:
+        market_info = None
+
+    timeframes_map = getattr(ex, "timeframes", None)
+    interval_minutes: Optional[int] = None
+    if isinstance(timeframes_map, dict):
+        value = timeframes_map.get(timeframe)
+        if value is not None:
+            try:
+                interval_minutes = int(value)
+            except Exception:
+                interval_minutes = None
+    if interval_minutes is None and timeframe_seconds:
+        try:
+            interval_minutes = max(int(timeframe_seconds // 60), 1)
+        except Exception:
+            interval_minutes = None
+
+    manual_uses_public = hasattr(ex, "publicGetOHLC")
+
+    def _parse_public_rows(raw_rows: list) -> list[list[float]]:
+        if not raw_rows:
+            return []
+        if market_info is not None and hasattr(ex, "parse_ohlcvs"):
+            try:
+                parsed = ex.parse_ohlcvs(raw_rows, market_info, timeframe, None, limit_per_page)
+                if isinstance(parsed, list):
+                    return [list(item) for item in parsed]
+            except Exception:
+                pass
+
+        parsed_rows: list[list[float]] = []
+        for row in raw_rows:
+            if not row:
+                continue
+            try:
+                ts_raw = row[0]
+                ts = int(float(ts_raw) * 1000)
+            except Exception:
+                continue
+            try:
+                open_ = float(row[1])
+                high = float(row[2])
+                low = float(row[3])
+                close = float(row[4])
+            except Exception:
+                continue
+            volume_index = 6 if len(row) > 6 else 5
+            try:
+                volume = float(row[volume_index])
+            except Exception:
+                volume = 0.0
+            parsed_rows.append([ts, open_, high, low, close, volume])
+        return parsed_rows
+
+    def _fetch_chunk(cursor: int) -> tuple[Optional[list[list[float]]], Optional[int], bool]:
+        if manual_uses_public and interval_minutes:
+            request = {"pair": market_id, "interval": interval_minutes}
+            frame_seconds = max(int(timeframe_seconds or 60), 1)
+            try:
+                since_seconds = max(int(cursor // 1000), 0)
+            except Exception:
+                since_seconds = 0
+            request["since"] = str(max(since_seconds - frame_seconds, 0))
+            try:
+                response = ex.publicGetOHLC(request)
+            except rate_limit_exc:
+                time.sleep(1.25)
+                return None, None, False
+            except Exception:
+                return None, None, False
+
+            result = {}
+            if isinstance(response, dict):
+                result = response.get("result", {}) or {}
+            raw_rows = []
+            if isinstance(result, dict):
+                raw_rows = result.get(market_id, []) or []
+            rows = _parse_public_rows(list(raw_rows))
+
+            last_ms: Optional[int] = None
+            if isinstance(result, dict) and "last" in result:
+                try:
+                    last_ms = int(float(result["last"]) * 1000)
+                except Exception:
+                    last_ms = None
+
+            return rows, last_ms, True
+
+        try:
+            rows = ex.fetch_ohlcv(
+                sym,
+                timeframe,
+                since=int(cursor),
+                limit=limit_per_page,
+            )
+        except rate_limit_exc:
+            time.sleep(1.25)
+            return None, None, False
+        except Exception:
+            return None, None, False
+        return rows or [], None, True
+
+    def _ingest_chunk(rows: Optional[list[list[float]]]) -> tuple[bool, Optional[int]]:
+        if not rows:
+            return False, None
+        added = False
+        newest = None
+        for row in rows:
+            if not row:
+                continue
+            ts = int(row[0])
+            if ts < since_ms or ts > target_end_ms + tolerance_ms:
+                continue
+            if ts in seen_ts:
+                continue
+            seen_ts.add(ts)
+            all_rows.append(row)
+            _update_bounds(ts)
+            added = True
+            if newest is None or ts > newest:
+                newest = ts
+        return added, newest
+
+    if limit_per_page > 0:
+        auto_calls = max(1, min(page_budget, 200))
+        auto_params = {"paginate": True, "paginationCalls": auto_calls, "until": target_end_ms}
+        try:
+            auto_rows = ex.fetch_ohlcv(
+                sym,
+                timeframe,
+                since=int(since_ms),
+                limit=limit_per_page,
+                params=auto_params,
+            )
+        except Exception:
+            auto_rows = []
+
+        if auto_rows:
+            estimated = _estimate_pages(len(auto_rows))
+            if estimated:
+                pages_hint = max(pages_hint, estimated)
+                pages_used = max(pages_used, min(page_budget, estimated))
+            _ingest_chunk(auto_rows)
+
+    if not _has_target_coverage():
+        first_chunk, _, ok = _fetch_chunk(since_ms)
+        if ok:
+            pages_used += 1
+            added, newest = _ingest_chunk(first_chunk)
+            if added and newest is not None:
+                pages_hint = max(pages_hint, 1)
+            elif first_chunk:
+                pages_hint = max(pages_hint, 1)
+
+    def _forward_paginate(start_cursor: int, pages_so_far: int) -> int:
+        cursor = start_cursor
         idle = 0
         max_idle = 3
-        while calls < page_budget and cursor <= target_end_ms + tolerance_ms:
-            try:
-                ohlcv_chunk = ex.fetch_ohlcv(sym, timeframe, since=int(cursor), limit=limit_per_page)
-            except ccxt.RateLimitExceeded:
-                time.sleep(1.25)
-                continue
-            except Exception:
-                break
-            if not ohlcv_chunk:
+        while pages_so_far < page_budget and cursor <= target_end_ms + tolerance_ms:
+            chunk, hint_cursor, ok = _fetch_chunk(cursor)
+            if not ok:
                 idle += 1
                 if idle >= max_idle:
                     cursor += max(chunk_span_ms, timeframe_ms)
                     idle = 0
                 else:
                     cursor += timeframe_ms
-                time.sleep(0.2)
                 continue
 
-            idle = 0
-            calls += 1
-            filtered: list[list[float]] = []
-            last_ts = cursor
-            for row in ohlcv_chunk:
-                ts = int(row[0])
-                if ts < since_ms or ts > target_end_ms + tolerance_ms:
-                    continue
-                if ts in seen_ts:
-                    continue
-                seen_ts.add(ts)
-                filtered.append(row)
-                if ts > last_ts:
-                    last_ts = ts
-
-            if filtered:
-                rows.extend(filtered)
-                advance = last_ts + timeframe_ms
-                if advance <= cursor:
-                    advance = cursor + timeframe_ms
-                cursor = advance
+            pages_so_far += 1
+            added, newest = _ingest_chunk(chunk)
+            if added and newest is not None:
+                next_cursor = newest + timeframe_ms
+                if hint_cursor is not None:
+                    next_cursor = max(next_cursor, hint_cursor)
+                if next_cursor <= cursor:
+                    cursor += max(chunk_span_ms, timeframe_ms)
+                else:
+                    cursor = next_cursor
+                idle = 0
             else:
-                cursor += timeframe_ms
+                idle += 1
+                if idle >= max_idle:
+                    cursor += max(chunk_span_ms, timeframe_ms)
+                    idle = 0
+                else:
+                    cursor += timeframe_ms
+
+            if _has_target_coverage():
+                break
 
             time.sleep(0.2)
 
-            if rows:
-                coverage_ms = rows[-1][0] - rows[0][0]
-                if desired_span_ms <= 0 or coverage_ms + tolerance_ms >= desired_span_ms:
-                    break
-        return rows, calls
+        return pages_so_far
 
-    manual_calls = 0
+    def _backfill_paginate(pages_so_far: int) -> int:
+        if min_ts is None:
+            return pages_so_far
 
-    try:
-        raw_rows = ex.fetch_ohlcv(
-            sym,
-            timeframe,
-            since=since_ms,
-            limit=limit_per_page,
-            params=params,
-        )
-        all_rows = list(raw_rows or [])
-        if all_rows:
-            pages = min(page_budget, max(1, math.ceil(len(all_rows) / max(limit_per_page, 1))))
-    except TypeError:
-        all_rows, manual_calls = _manual_fetch()
-        pages = manual_calls or pages
-        manual_attempted = True
-    except Exception:
-        all_rows, manual_calls = _manual_fetch()
-        pages = manual_calls or pages
-        manual_attempted = True
+        cursor = max(min_ts - chunk_span_ms, since_ms)
+        idle = 0
+        max_idle = 3
+        while pages_so_far < page_budget and cursor + tolerance_ms >= since_ms:
+            chunk, _, ok = _fetch_chunk(cursor)
+            if not ok:
+                idle += 1
+                if idle >= max_idle:
+                    if cursor <= since_ms:
+                        break
+                    cursor = max(cursor - max(chunk_span_ms, timeframe_ms), since_ms)
+                    idle = 0
+                else:
+                    cursor = max(cursor - timeframe_ms, since_ms)
+                continue
 
-    if all_rows and not manual_attempted:
-        ts_values = [int(row[0]) for row in all_rows if row]
-        coverage_ms = (max(ts_values) - min(ts_values)) if ts_values else 0
-        coverage_met = desired_span_ms <= 0 or coverage_ms + tolerance_ms >= desired_span_ms
-        if not coverage_met:
-            manual_rows, manual_calls = _manual_fetch()
-            manual_attempted = True
-            if manual_rows:
-                all_rows.extend(manual_rows)
-            if manual_calls:
-                pages = max(pages, manual_calls)
+            pages_so_far += 1
+            added, _ = _ingest_chunk(chunk)
+            if added:
+                cursor = max((min_ts or since_ms) - chunk_span_ms, since_ms)
+                idle = 0
+            else:
+                idle += 1
+                if idle >= max_idle:
+                    if cursor <= since_ms:
+                        break
+                    cursor = max(cursor - max(chunk_span_ms, timeframe_ms), since_ms)
+                    idle = 0
+                else:
+                    cursor = max(cursor - timeframe_ms, since_ms)
 
-    if (not all_rows) and not manual_attempted:
-        manual_rows, manual_calls = _manual_fetch()
-        manual_attempted = True
-        if manual_rows:
-            all_rows = manual_rows
-        if manual_calls:
-            pages = manual_calls
+            if _has_target_coverage():
+                break
+
+            time.sleep(0.2)
+
+        return pages_so_far
+
+    if max_ts is None or max_ts + tolerance_ms < target_end_ms:
+        start_cursor = since_ms if max_ts is None else max(max_ts + timeframe_ms, since_ms)
+        pages_used = _forward_paginate(start_cursor, pages_used)
+
+    if not _has_target_coverage() and min_ts is not None and min_ts > since_ms + tolerance_ms:
+        pages_used = _backfill_paginate(pages_used)
+
+    if max_ts is not None and max_ts + tolerance_ms < target_end_ms and not _has_target_coverage():
+        start_cursor = since_ms if max_ts is None else max(max_ts + timeframe_ms, since_ms)
+        pages_used = _forward_paginate(start_cursor, pages_used)
+
+    if not _has_target_coverage():
+        dataset_rows = _kraken_dataset_rows(sym, timeframe, since_ms, target_end_ms, tolerance_ms)
+        if dataset_rows:
+            _ingest_chunk(dataset_rows)
+
+    unique_rows = len(all_rows)
+    if pages_hint <= 0 and unique_rows:
+        pages_hint = math.ceil(unique_rows / max(limit_per_page, 1))
+
+    pages = max(pages_hint, pages_used)
 
     if not all_rows:
         empty = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
@@ -238,19 +636,9 @@ def fetch_ohlcv(
             reached_target=False,
         )
 
-    filtered_rows: list[list[float]] = []
-    seen_ts: set[int] = set()
-    for row in all_rows:
-        ts = int(row[0])
-        if ts < since_ms or ts > target_end_ms + tolerance_ms:
-            continue
-        if ts in seen_ts:
-            continue
-        seen_ts.add(ts)
-        filtered_rows.append(row)
+    all_rows.sort(key=lambda item: item[0])
 
-    filtered_rows.sort(key=lambda item: item[0])
-    df = pd.DataFrame(filtered_rows, columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"])
+    df = pd.DataFrame(all_rows, columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"])
     df["Timestamp"] = pd.to_datetime(df["Timestamp"], unit="ms", utc=True)
     df = df.drop_duplicates(subset=["Timestamp"]).set_index("Timestamp").sort_index()
     requested_start = pd.to_datetime(since_ms, unit="ms", utc=True)
