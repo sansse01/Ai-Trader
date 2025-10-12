@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import math
+import os
+import sys
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Optional
-from urllib.request import urlretrieve
+from urllib.request import Request, urlopen, urlretrieve
 import zipfile
 from io import BytesIO
 
@@ -86,16 +88,113 @@ def _is_stale(path: Path, max_age: timedelta) -> bool:
     return datetime.now(UTC) - modified > max_age
 
 
+def _format_size(size: Optional[int]) -> str:
+    if size is None or size <= 0:
+        return "an unknown size"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    value = float(size)
+    unit = "B"
+    for unit_name in units:
+        unit = unit_name
+        if value < 1024.0 or unit_name == units[-1]:
+            break
+        value /= 1024.0
+    if value >= 10 or unit == "B":
+        formatted = f"{value:.0f}"
+    else:
+        formatted = f"{value:.1f}"
+    return f"{formatted} {unit}"
+
+
+def _kraken_zip_remote_size() -> Optional[int]:
+    try:
+        request = Request(_KRAKEN_DATASET_URL, method="HEAD")
+        with urlopen(request) as response:  # type: ignore[arg-type]
+            length = response.headers.get("Content-Length")
+            if length:
+                return int(length)
+    except Exception:
+        pass
+
+    try:
+        with urlopen(_KRAKEN_DATASET_URL) as response:  # type: ignore[arg-type]
+            length = response.headers.get("Content-Length")
+            if length:
+                return int(length)
+    except Exception:
+        return None
+    return None
+
+
+def _auto_confirm_env() -> Optional[bool]:
+    value = os.environ.get("KRAKEN_CACHE_AUTO_CONFIRM")
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "y"}:
+        return True
+    if normalized in {"0", "false", "no", "n"}:
+        return False
+    return None
+
+
+def _confirm_dataset_download(size: Optional[int]) -> bool:
+    size_label = _format_size(size)
+    env_choice = _auto_confirm_env()
+    if env_choice is not None:
+        if env_choice:
+            print(
+                f"Automatically approving Kraken OHLC dataset download (~{size_label}) "
+                "due to KRAKEN_CACHE_AUTO_CONFIRM."
+            )
+        else:
+            print(
+                f"Skipping Kraken OHLC dataset download (~{size_label}) "
+                "due to KRAKEN_CACHE_AUTO_CONFIRM."
+            )
+        return env_choice
+
+    if not sys.stdin or not sys.stdin.isatty() or not sys.stdout or not sys.stdout.isatty():
+        print(
+            "Kraken OHLC dataset download requires confirmation, but no interactive "
+            "terminal is available. Set KRAKEN_CACHE_AUTO_CONFIRM=1 to permit the download."
+        )
+        return False
+
+    prompt = (
+        f"The Kraken OHLC dataset is approximately {size_label}. "
+        "Proceed with download? [y/N]: "
+    )
+    try:
+        response = input(prompt)
+    except EOFError:
+        return False
+    return response.strip().lower() in {"y", "yes"}
+
+
 def _download_kraken_zip(cache_root: Path) -> Optional[Path]:
     zip_path = cache_root / _KRAKEN_ZIP_FILENAME
     if zip_path.exists() and not _is_stale(zip_path, _KRAKEN_ZIP_MAX_AGE):
         return zip_path
 
     cache_root.mkdir(parents=True, exist_ok=True)
+    size_bytes = _kraken_zip_remote_size()
+    if not _confirm_dataset_download(size_bytes):
+        if zip_path.exists():
+            print(
+                "Download cancelled; using existing Kraken OHLC dataset despite staleness."
+            )
+            return zip_path
+        print("Download cancelled; Kraken OHLC dataset not available in cache.")
+        return None
+
     tmp_path = zip_path.with_suffix(".tmp")
     try:
         urlretrieve(_KRAKEN_DATASET_URL, tmp_path)
         tmp_path.replace(zip_path)
+        print(
+            f"Kraken OHLC dataset downloaded to {zip_path} (~{_format_size(size_bytes)})."
+        )
         return zip_path
     except Exception:
         if tmp_path.exists():

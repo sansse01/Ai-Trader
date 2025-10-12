@@ -145,3 +145,45 @@ def test_fetch_ohlcv_uses_cache_roundtrip(tmp_path: Path, monkeypatch):
     assert len(cached_after_second) == total_first_call_rows + 1
     expected_last_ts = pd.to_datetime(start_ms + frame_ms * (total_first_call_rows), unit="ms", utc=True)
     assert cached_after_second.index.max() == expected_last_ts
+
+
+def test_download_kraken_zip_requires_confirmation(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(fetcher, "_kraken_zip_remote_size", lambda: 1024)
+    monkeypatch.setattr(fetcher, "_confirm_dataset_download", lambda size: False)
+
+    called = False
+
+    def fake_urlretrieve(url, filename, reporthook=None, data=None):
+        nonlocal called
+        called = True
+        raise AssertionError("Download should not proceed when confirmation is denied")
+
+    monkeypatch.setattr(fetcher, "urlretrieve", fake_urlretrieve)
+
+    result = fetcher._download_kraken_zip(tmp_path)
+    assert result is None
+    assert called is False
+
+
+def test_download_kraken_zip_confirms_and_downloads(monkeypatch, tmp_path: Path):
+    size = 2048
+    monkeypatch.setattr(fetcher, "_kraken_zip_remote_size", lambda: size)
+    monkeypatch.setattr(fetcher, "_confirm_dataset_download", lambda value: True)
+
+    def fake_urlretrieve(url, filename, reporthook=None, data=None):
+        Path(filename).write_bytes(b"zipdata")
+        return str(filename), None
+
+    monkeypatch.setattr(fetcher, "urlretrieve", fake_urlretrieve)
+
+    result = fetcher._download_kraken_zip(tmp_path)
+    assert result is not None
+    assert result.exists()
+    assert result.read_bytes() == b"zipdata"
+
+
+def test_confirm_dataset_download_env(monkeypatch):
+    monkeypatch.setenv("KRAKEN_CACHE_AUTO_CONFIRM", "1")
+    assert fetcher._confirm_dataset_download(1024) is True
+    monkeypatch.setenv("KRAKEN_CACHE_AUTO_CONFIRM", "0")
+    assert fetcher._confirm_dataset_download(1024) is False
