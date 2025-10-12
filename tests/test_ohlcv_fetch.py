@@ -101,7 +101,7 @@ def test_fetch_ohlcv_uses_cache_roundtrip(tmp_path: Path, monkeypatch):
 
     download_calls = 0
 
-    def fake_download(root: Path) -> Path:
+    def fake_download(root: Path, confirm_download=None) -> Path:
         nonlocal download_calls
         download_calls += 1
         root.mkdir(parents=True, exist_ok=True)
@@ -124,6 +124,7 @@ def test_fetch_ohlcv_uses_cache_roundtrip(tmp_path: Path, monkeypatch):
     )
 
     assert result_first.rows == total_first_call_rows
+    assert result_first.max_pages <= 3
     assert download_calls == 1
     cached_after_first = fetcher._read_cached_dataset("BTC/EUR", "1h", cache_root)
     assert len(cached_after_first) == total_first_call_rows
@@ -140,6 +141,7 @@ def test_fetch_ohlcv_uses_cache_roundtrip(tmp_path: Path, monkeypatch):
     )
 
     assert result_second.rows == total_first_call_rows + 1
+    assert result_second.max_pages <= 3
     assert download_calls == 1
     cached_after_second = fetcher._read_cached_dataset("BTC/EUR", "1h", cache_root)
     assert len(cached_after_second) == total_first_call_rows + 1
@@ -149,7 +151,11 @@ def test_fetch_ohlcv_uses_cache_roundtrip(tmp_path: Path, monkeypatch):
 
 def test_download_kraken_zip_requires_confirmation(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(fetcher, "_kraken_zip_remote_size", lambda: 1024)
-    monkeypatch.setattr(fetcher, "_confirm_dataset_download", lambda size: False)
+
+    def deny(size, **_kwargs):
+        return False
+
+    monkeypatch.setattr(fetcher, "_confirm_dataset_download", deny)
 
     called = False
 
@@ -168,7 +174,11 @@ def test_download_kraken_zip_requires_confirmation(monkeypatch, tmp_path: Path):
 def test_download_kraken_zip_confirms_and_downloads(monkeypatch, tmp_path: Path):
     size = 2048
     monkeypatch.setattr(fetcher, "_kraken_zip_remote_size", lambda: size)
-    monkeypatch.setattr(fetcher, "_confirm_dataset_download", lambda value: True)
+
+    def approve(value, **_kwargs):
+        return True
+
+    monkeypatch.setattr(fetcher, "_confirm_dataset_download", approve)
 
     def fake_urlretrieve(url, filename, reporthook=None, data=None):
         Path(filename).write_bytes(b"zipdata")

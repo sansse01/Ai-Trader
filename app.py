@@ -81,6 +81,54 @@ def make_json_safe(value: Any) -> Any:
     return value
 
 
+def _format_download_size(size: Optional[int]) -> str:
+    if not size or size <= 0:
+        return "an unknown size"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    value = float(size)
+    unit = units[0]
+    for unit in units:
+        if value < 1024.0 or unit == units[-1]:
+            break
+        value /= 1024.0
+    formatted = f"{value:.0f}" if value >= 10 or unit == "B" else f"{value:.1f}"
+    return f"{formatted} {unit}"
+
+
+def _prompt_kraken_dataset_download(
+    symbol: str, timeframe: str, size: Optional[int]
+) -> bool:
+    key = f"kraken_dataset_confirm::{symbol}::{timeframe}"
+    decision = st.session_state.get(key)
+    if isinstance(decision, bool):
+        return decision
+
+    size_label = _format_download_size(size)
+    prompt = (
+        f"The Kraken OHLC dataset (~{size_label}) is required to backfill {symbol} "
+        f"{timeframe} candles."
+    )
+    warning_box = st.container()
+    warning_box.warning(prompt, icon="⬇️")
+    warning_box.caption(
+        "Downloading once stores the archive locally so future runs can reuse it."
+    )
+    col_accept, col_skip = warning_box.columns(2)
+    with col_accept:
+        if st.button(
+            "Download dataset", key=f"{key}::approve", use_container_width=True
+        ):
+            st.session_state[key] = True
+            st.experimental_rerun()
+    with col_skip:
+        if st.button(
+            "Skip download", key=f"{key}::skip", use_container_width=True
+        ):
+            st.session_state[key] = False
+            st.experimental_rerun()
+    st.stop()
+
+
 @st.cache_data(show_spinner=False)
 def fetch_ohlcv(
     symbol: str,
@@ -89,12 +137,16 @@ def fetch_ohlcv(
     target_end_ms: Optional[int] = None,
     limit_per_page: int = 720,
 ) -> OHLCVFetchResult:
+    def _confirm(size: Optional[int]) -> bool:
+        return _prompt_kraken_dataset_download(symbol, timeframe, size)
+
     return fetch_ohlcv_core(
         symbol=symbol,
         timeframe=timeframe,
         since_ms=since_ms,
         target_end_ms=target_end_ms,
         limit_per_page=limit_per_page,
+        confirm_download=_confirm,
     )
 
 

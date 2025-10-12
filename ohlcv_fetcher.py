@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 from urllib.request import Request, urlopen, urlretrieve
 import zipfile
 from io import BytesIO
@@ -138,7 +138,13 @@ def _auto_confirm_env() -> Optional[bool]:
     return None
 
 
-def _confirm_dataset_download(size: Optional[int]) -> bool:
+ConfirmDownloadCallback = Callable[[Optional[int]], bool]
+
+
+def _confirm_dataset_download(
+    size: Optional[int],
+    override: Optional[ConfirmDownloadCallback] = None,
+) -> bool:
     size_label = _format_size(size)
     env_choice = _auto_confirm_env()
     if env_choice is not None:
@@ -153,6 +159,9 @@ def _confirm_dataset_download(size: Optional[int]) -> bool:
                 "due to KRAKEN_CACHE_AUTO_CONFIRM."
             )
         return env_choice
+
+    if override is not None:
+        return override(size)
 
     if not sys.stdin or not sys.stdin.isatty() or not sys.stdout or not sys.stdout.isatty():
         print(
@@ -172,14 +181,17 @@ def _confirm_dataset_download(size: Optional[int]) -> bool:
     return response.strip().lower() in {"y", "yes"}
 
 
-def _download_kraken_zip(cache_root: Path) -> Optional[Path]:
+def _download_kraken_zip(
+    cache_root: Path,
+    confirm_download: Optional[ConfirmDownloadCallback] = None,
+) -> Optional[Path]:
     zip_path = cache_root / _KRAKEN_ZIP_FILENAME
     if zip_path.exists() and not _is_stale(zip_path, _KRAKEN_ZIP_MAX_AGE):
         return zip_path
 
     cache_root.mkdir(parents=True, exist_ok=True)
     size_bytes = _kraken_zip_remote_size()
-    if not _confirm_dataset_download(size_bytes):
+    if not _confirm_dataset_download(size_bytes, override=confirm_download):
         if zip_path.exists():
             print(
                 "Download cancelled; using existing Kraken OHLC dataset despite staleness."
@@ -319,13 +331,14 @@ def _kraken_dataset_rows(
     symbol: str,
     timeframe: str,
     cache_root: Optional[Path] = None,
+    confirm_download: Optional[ConfirmDownloadCallback] = None,
 ) -> pd.DataFrame:
     root = _kraken_cache_root(cache_root)
     cached = _read_cached_dataset(symbol, timeframe, root)
     if not cached.empty and not _is_stale(_cache_dataset_path(symbol, timeframe, root), _KRAKEN_DATASET_MAX_AGE):
         return cached
 
-    zip_path = _download_kraken_zip(root)
+    zip_path = _download_kraken_zip(root, confirm_download=confirm_download)
     if zip_path is not None:
         fresh = _extract_kraken_dataset(zip_path, symbol, timeframe, root)
         if not fresh.empty:
@@ -389,6 +402,7 @@ def fetch_ohlcv(
     target_end_ms: Optional[int] = None,
     limit_per_page: int = 720,
     cache_root: Optional[Path | str] = None,
+    confirm_download: Optional[ConfirmDownloadCallback] = None,
 ) -> OHLCVFetchResult:
     ex = ccxt.kraken()
     sym = normalize_symbol(ex, symbol)
@@ -403,20 +417,34 @@ def fetch_ohlcv(
     if target_end_ms <= since_ms:
         target_end_ms = since_ms + timeframe_ms
 
-    desired_span_ms = max(0, target_end_ms - since_ms)
-    chunk_span_ms = limit_per_page * timeframe_ms
-    approx_pages = math.ceil(desired_span_ms / chunk_span_ms) if chunk_span_ms else 1
-    page_budget = max(min(approx_pages + 5, 2400), 4)
-
     tolerance_ms = max(timeframe_ms, 60_000)
     cache_root_path = _kraken_cache_root(cache_root)
     dataset_symbol = sym
-    dataset_rows = _kraken_dataset_rows(sym, timeframe, cache_root_path)
+    dataset_rows = _kraken_dataset_rows(
+        sym, timeframe, cache_root_path, confirm_download=confirm_download
+    )
     if dataset_rows.empty and symbol != sym:
-        alt_rows = _kraken_dataset_rows(symbol, timeframe, cache_root_path)
+        alt_rows = _kraken_dataset_rows(
+            symbol, timeframe, cache_root_path, confirm_download=confirm_download
+        )
         if not alt_rows.empty:
             dataset_rows = alt_rows
             dataset_symbol = symbol
+
+    desired_span_ms = max(0, target_end_ms - since_ms)
+    if not dataset_rows.empty:
+        dataset_start_ms = int(dataset_rows.index.min().timestamp() * 1000)
+        dataset_end_ms = int(dataset_rows.index.max().timestamp() * 1000)
+        missing_before_ms = max(0, since_ms - dataset_start_ms)
+        missing_after_ms = max(0, target_end_ms - dataset_end_ms)
+        if missing_before_ms <= 0:
+            desired_span_ms = missing_after_ms
+        else:
+            desired_span_ms = missing_before_ms + missing_after_ms
+
+    chunk_span_ms = limit_per_page * timeframe_ms
+    approx_pages = math.ceil(desired_span_ms / chunk_span_ms) if chunk_span_ms else 1
+    page_budget = max(min(approx_pages + 2, 120), 2)
 
     params = {"paginate": True, "paginationCalls": page_budget}
     all_rows: list[list[float]] = []
