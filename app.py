@@ -95,14 +95,27 @@ def _format_download_size(size: Optional[int]) -> str:
     return f"{formatted} {unit}"
 
 
+_KRAKEN_CONFIRM_STATE_KEY = "kraken_dataset_confirm::{symbol}::{timeframe}"
+
+
+class KrakenDatasetDownloadDecisionRequired(RuntimeError):
+    """Signal that a cached fetch needs user confirmation to continue."""
+
+    def __init__(self, size: Optional[int]):
+        super().__init__(
+            "Kraken dataset download requires explicit approval before continuing."
+        )
+        self.size = size
+
+
+def _kraken_download_state_key(symbol: str, timeframe: str) -> str:
+    return _KRAKEN_CONFIRM_STATE_KEY.format(symbol=symbol, timeframe=timeframe)
+
+
 def _prompt_kraken_dataset_download(
     symbol: str, timeframe: str, size: Optional[int]
-) -> bool:
-    key = f"kraken_dataset_confirm::{symbol}::{timeframe}"
-    decision = st.session_state.get(key)
-    if isinstance(decision, bool):
-        return decision
-
+) -> None:
+    key = _kraken_download_state_key(symbol, timeframe)
     size_label = _format_download_size(size)
     prompt = (
         f"The Kraken OHLC dataset (~{size_label}) is required to backfill {symbol} "
@@ -119,26 +132,28 @@ def _prompt_kraken_dataset_download(
             "Download dataset", key=f"{key}::approve", use_container_width=True
         ):
             st.session_state[key] = True
-            st.experimental_rerun()
+            st.rerun()
     with col_skip:
         if st.button(
             "Skip download", key=f"{key}::skip", use_container_width=True
         ):
             st.session_state[key] = False
-            st.experimental_rerun()
-    st.stop()
+            st.rerun()
 
 
 @st.cache_data(show_spinner=False)
-def fetch_ohlcv(
+def _cached_fetch_ohlcv(
     symbol: str,
     timeframe: str,
     since_ms: int,
     target_end_ms: Optional[int] = None,
     limit_per_page: int = 720,
+    download_decision: Optional[bool] = None,
 ) -> OHLCVFetchResult:
     def _confirm(size: Optional[int]) -> bool:
-        return _prompt_kraken_dataset_download(symbol, timeframe, size)
+        if download_decision is None:
+            raise KrakenDatasetDownloadDecisionRequired(size)
+        return download_decision
 
     return fetch_ohlcv_core(
         symbol=symbol,
@@ -148,6 +163,35 @@ def fetch_ohlcv(
         limit_per_page=limit_per_page,
         confirm_download=_confirm,
     )
+
+
+def fetch_ohlcv(
+    symbol: str,
+    timeframe: str,
+    since_ms: int,
+    target_end_ms: Optional[int] = None,
+    limit_per_page: int = 720,
+) -> OHLCVFetchResult:
+    key = _kraken_download_state_key(symbol, timeframe)
+    stored_decision = st.session_state.get(key)
+    download_decision: Optional[bool]
+    if isinstance(stored_decision, bool):
+        download_decision = stored_decision
+    else:
+        download_decision = None
+
+    try:
+        return _cached_fetch_ohlcv(
+            symbol=symbol,
+            timeframe=timeframe,
+            since_ms=since_ms,
+            target_end_ms=target_end_ms,
+            limit_per_page=limit_per_page,
+            download_decision=download_decision,
+        )
+    except KrakenDatasetDownloadDecisionRequired as exc:
+        _prompt_kraken_dataset_download(symbol, timeframe, exc.size)
+        st.stop()
 
 
 def _controls_from_schema(model: Any) -> tuple[OrderedDict[str, Dict[str, Any]], Dict[str, Any]]:
@@ -1101,7 +1145,7 @@ def render_trading_console():
                             st.session_state[param_name] = param_value
                     st.session_state.pop("builder_pending_apply", None)
                     st.success("Champion parameters applied to the controls.")
-                    st.experimental_rerun()
+                    st.rerun()
             else:
                 st.caption(
                     f"Champion parameters available for strategy '{target_strategy}'. Switch strategies to apply them."
@@ -1319,7 +1363,7 @@ def render_trading_console():
                         st.session_state.pop(f"{base_key}__max", None)
                         st.session_state.pop(f"{base_key}__step", None)
                     st.success("Preset loaded. Refreshing controls...")
-                    st.experimental_rerun()
+                    st.rerun()
 
         allow_shorts = st.checkbox("Allow shorts", value=st.session_state.get("allow_shorts", True), key="allow_shorts")
         ignore_trend = st.checkbox("Ignore trend filter (debug)", value=st.session_state.get("ignore_trend", False), key="ignore_trend")
@@ -1801,7 +1845,7 @@ def render_trading_console():
                                     st.session_state[f"ctrl::{selected_strategy_key}::{k}"] = v
                                 elif k in {"allow_shorts", "ignore_trend", "sizing_mode"}:
                                     st.session_state[k] = v
-                            st.experimental_rerun()
+                            st.rerun()
                     else:
                         st.warning("No results produced during optimization.")
 
