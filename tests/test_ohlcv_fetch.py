@@ -149,6 +149,46 @@ def test_fetch_ohlcv_uses_cache_roundtrip(tmp_path: Path, monkeypatch):
     assert cached_after_second.index.max() == expected_last_ts
 
 
+def test_fetch_ohlcv_returns_cached_rows_when_exchange_empty(tmp_path: Path, monkeypatch):
+    frame_ms = 60 * 60 * 1000
+    start_ms = 0
+    dataset_rows = 4
+    cache_root = tmp_path / "cache"
+    zip_path = tmp_path / "ohlc.zip"
+    _build_dataset_zip(zip_path, "BTCEUR", "1h", start_ms, frame_ms, dataset_rows)
+
+    download_calls = 0
+
+    def fake_download(root: Path, confirm_download=None) -> Path:
+        nonlocal download_calls
+        download_calls += 1
+        root.mkdir(parents=True, exist_ok=True)
+        dest = root / fetcher._KRAKEN_ZIP_FILENAME
+        dest.write_bytes(zip_path.read_bytes())
+        return dest
+
+    empty_exchange = FakeKrakenExchange(start_ms=start_ms, rows=0, frame_ms=frame_ms)
+
+    monkeypatch.setattr(fetcher, "_download_kraken_zip", fake_download)
+    monkeypatch.setattr(fetcher.ccxt, "kraken", lambda: empty_exchange)
+
+    result = fetcher.fetch_ohlcv(
+        symbol="BTC/EUR",
+        timeframe="1h",
+        since_ms=start_ms,
+        target_end_ms=start_ms + frame_ms * (dataset_rows - 1),
+        limit_per_page=720,
+        cache_root=cache_root,
+    )
+
+    assert result.rows == dataset_rows
+    assert result.reached_target is True
+    assert download_calls == 1
+    cached_rows = fetcher._read_cached_dataset("BTC/EUR", "1h", cache_root)
+    assert list(result.data.index) == list(cached_rows.index)
+    pd.testing.assert_frame_equal(result.data, cached_rows)
+
+
 def test_download_kraken_zip_requires_confirmation(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(fetcher, "_kraken_zip_remote_size", lambda: 1024)
 

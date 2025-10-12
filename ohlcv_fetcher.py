@@ -550,20 +550,6 @@ def fetch_ohlcv(
         if manual_calls:
             pages = manual_calls
 
-    if not all_rows:
-        empty = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
-        empty.index = pd.DatetimeIndex([], tz="UTC")
-        return OHLCVFetchResult(
-            empty,
-            pages=pages,
-            limit_per_page=limit_per_page,
-            max_pages=page_budget,
-            requested_start=pd.to_datetime(since_ms, unit="ms", utc=True),
-            requested_end=pd.to_datetime(target_end_ms, unit="ms", utc=True),
-            target_coverage=pd.to_timedelta(desired_span_ms, unit="ms"),
-            reached_target=False,
-        )
-
     filtered_rows: list[list[float]] = []
     seen_ts: set[int] = set()
     for row in all_rows:
