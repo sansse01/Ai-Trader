@@ -2,7 +2,7 @@
 streamlit>=1.36
 pandas>=2.0
 numpy>=1.24
-ccxt>=4.3.80
+ccxt>=4.3.80  # Kraken/CCXT client
 backtesting==0.3.3
 backtrader>=1.9.78.123
 plotly>=5.22
