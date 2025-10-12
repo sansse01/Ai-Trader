@@ -15,6 +15,11 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+try:  # pragma: no cover - exercised via Streamlit runtime
+    import ccxt  # type: ignore
+except Exception:  # pragma: no cover - ccxt optional for non-fetch features
+    ccxt = None  # type: ignore[assignment]
+
 from ohlcv_fetcher import (
     OHLCVFetchResult,
     fetch_ohlcv as fetch_ohlcv_core,
@@ -1122,6 +1127,13 @@ def render_trading_console():
         st.session_state["symbol"] = symbol
         timeframe = st.selectbox("Timeframe", ["1h", "4h", "1d"], index=["1h", "4h", "1d"].index(st.session_state.get("timeframe", "1h")), key="timeframe")
         since_str = st.text_input("Since (UTC ISO8601)", value=st.session_state.get("since_str", "2022-01-01T00:00:00Z"), key="since_str")
+        if ccxt is None:
+            st.error(
+                "The `ccxt` package is required to fetch Kraken OHLC data. "
+                "Install it with `pip install ccxt` and restart the app."
+            )
+            st.stop()
+
         ex = ccxt.kraken()
         try:
             since_ms = ex.parse8601(since_str)
