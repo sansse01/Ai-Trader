@@ -32,6 +32,36 @@ def _build_dataset_zip(
         zf.writestr(f"ohlc/{pair}/{timeframe}.csv", buffer.getvalue())
 
 
+def test_extract_dataset_handles_pair_variants(tmp_path: Path):
+    frame_ms = 60 * 1000
+    start_ms = 0
+    rows = 4
+    zip_path = tmp_path / "ohlc.zip"
+    _build_dataset_zip(zip_path, "BTC_EUR", "1H", start_ms, frame_ms, rows)
+
+    cache_root = tmp_path / "cache"
+    frame = fetcher._extract_kraken_dataset(zip_path, "BTC/EUR", "1h", cache_root)
+
+    assert len(frame) == rows
+    cached = fetcher._read_cached_dataset("BTC/EUR", "1h", cache_root)
+    assert len(cached) == rows
+
+
+def test_extract_dataset_accepts_xbt_alias(tmp_path: Path):
+    frame_ms = 60 * 1000
+    start_ms = 0
+    rows = 3
+    zip_path = tmp_path / "ohlc.zip"
+    _build_dataset_zip(zip_path, "XBT_EUR", "1h", start_ms, frame_ms, rows)
+
+    cache_root = tmp_path / "cache"
+    frame = fetcher._extract_kraken_dataset(zip_path, "BTC/EUR", "1h", cache_root)
+
+    assert len(frame) == rows
+    cached = fetcher._read_cached_dataset("BTC/EUR", "1h", cache_root)
+    assert len(cached) == rows
+
+
 class FakeKrakenExchange:
     def __init__(self, start_ms: int, rows: int, frame_ms: int) -> None:
         self.start_ms = start_ms

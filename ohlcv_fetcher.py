@@ -73,6 +73,20 @@ def _symbol_to_cache_pair(symbol: str) -> str:
     return symbol.replace("/", "").replace(" ", "").upper()
 
 
+def _normalize_pair_token(value: str) -> str:
+    return "".join(ch for ch in value.lower() if ch.isalnum())
+
+
+def _pair_aliases(pair: str) -> set[str]:
+    normalized = _normalize_pair_token(pair)
+    aliases = {normalized}
+    if "btc" in normalized:
+        aliases.add(normalized.replace("btc", "xbt"))
+    if "xbt" in normalized:
+        aliases.add(normalized.replace("xbt", "btc"))
+    return {alias for alias in aliases if alias}
+
+
 def _cache_dataset_path(symbol: str, timeframe: str, cache_root: Path) -> Path:
     pair = _symbol_to_cache_pair(symbol)
     return cache_root / pair / timeframe / _KRAKEN_CACHE_FILENAME
@@ -300,8 +314,12 @@ def _extract_kraken_dataset(zip_path: Path, symbol: str, timeframe: str, cache_r
     try:
         with zipfile.ZipFile(zip_path) as zf:
             pair = _symbol_to_cache_pair(symbol)
-            pair_lower = pair.lower()
-            timeframe_name = f"{timeframe.lower()}.csv"
+            pair_aliases = _pair_aliases(pair)
+            timeframe_lower = timeframe.lower()
+            timeframe_candidates = {
+                timeframe_lower,
+                f"{timeframe_lower}.csv",
+            }
             target_name: Optional[str] = None
             for info in zf.infolist():
                 if info.is_dir():
@@ -309,10 +327,15 @@ def _extract_kraken_dataset(zip_path: Path, symbol: str, timeframe: str, cache_r
                 parts = Path(info.filename).parts
                 if not parts:
                     continue
-                filename = parts[-1].lower()
-                if filename != timeframe_name:
+                filename = parts[-1]
+                filename_lower = filename.lower()
+                if (
+                    filename_lower not in timeframe_candidates
+                    and filename_lower.removesuffix(".csv") not in timeframe_candidates
+                ):
                     continue
-                if any(part.lower() == pair_lower for part in parts):
+                normalized_parts = {_normalize_pair_token(part) for part in parts}
+                if pair_aliases.intersection(normalized_parts):
                     target_name = info.filename
                     break
             if target_name is None:
