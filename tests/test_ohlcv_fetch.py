@@ -103,9 +103,11 @@ def test_fetch_ohlcv_uses_cache_roundtrip(tmp_path: Path, monkeypatch):
 
     def fake_download(root: Path, confirm_download=None) -> Path:
         nonlocal download_calls
-        download_calls += 1
         root.mkdir(parents=True, exist_ok=True)
         dest = root / fetcher._KRAKEN_ZIP_FILENAME
+        if dest.exists():
+            return dest
+        download_calls += 1
         dest.write_bytes(zip_path.read_bytes())
         return dest
 
@@ -161,9 +163,11 @@ def test_fetch_ohlcv_returns_cached_rows_when_exchange_empty(tmp_path: Path, mon
 
     def fake_download(root: Path, confirm_download=None) -> Path:
         nonlocal download_calls
-        download_calls += 1
         root.mkdir(parents=True, exist_ok=True)
         dest = root / fetcher._KRAKEN_ZIP_FILENAME
+        if dest.exists():
+            return dest
+        download_calls += 1
         dest.write_bytes(zip_path.read_bytes())
         return dest
 
@@ -187,6 +191,68 @@ def test_fetch_ohlcv_returns_cached_rows_when_exchange_empty(tmp_path: Path, mon
     cached_rows = fetcher._read_cached_dataset("BTC/EUR", "1h", cache_root)
     assert list(result.data.index) == list(cached_rows.index)
     pd.testing.assert_frame_equal(result.data, cached_rows)
+
+
+def test_fetch_ohlcv_downloads_dataset_when_cache_incomplete(tmp_path: Path, monkeypatch):
+    frame_ms = 60 * 60 * 1000
+    start_ms = 0
+    cached_rows = 2
+    expected_rows = 5
+    cache_root = tmp_path / "cache"
+    partial_index = [
+        pd.to_datetime(start_ms + frame_ms * idx, unit="ms", utc=True)
+        for idx in range(cached_rows)
+    ]
+    partial_frame = pd.DataFrame(
+        {
+            "Open": [1.0 + idx for idx in range(cached_rows)],
+            "High": [2.0 + idx for idx in range(cached_rows)],
+            "Low": [0.5 + idx for idx in range(cached_rows)],
+            "Close": [1.5 + idx for idx in range(cached_rows)],
+            "Volume": [100.0 + idx for idx in range(cached_rows)],
+        },
+        index=pd.DatetimeIndex(partial_index, name="Timestamp"),
+    )
+    fetcher._write_cached_dataset("BTC/EUR", "1h", partial_frame, cache_root)
+
+    zip_path = tmp_path / "ohlc.zip"
+    _build_dataset_zip(zip_path, "BTCEUR", "1h", start_ms, frame_ms, expected_rows)
+
+    download_calls = 0
+
+    def fake_download(root: Path, confirm_download=None) -> Path:
+        nonlocal download_calls
+        root.mkdir(parents=True, exist_ok=True)
+        dest = root / fetcher._KRAKEN_ZIP_FILENAME
+        if dest.exists():
+            return dest
+        download_calls += 1
+        dest.write_bytes(zip_path.read_bytes())
+        return dest
+
+    empty_exchange = FakeKrakenExchange(start_ms=start_ms, rows=0, frame_ms=frame_ms)
+
+    monkeypatch.setattr(fetcher, "_download_kraken_zip", fake_download)
+    monkeypatch.setattr(fetcher.ccxt, "kraken", lambda: empty_exchange)
+
+    result = fetcher.fetch_ohlcv(
+        symbol="BTC/EUR",
+        timeframe="1h",
+        since_ms=start_ms,
+        target_end_ms=start_ms + frame_ms * (expected_rows - 1),
+        limit_per_page=720,
+        cache_root=cache_root,
+    )
+
+    assert download_calls == 1
+    assert result.rows == expected_rows
+    cached_after = fetcher._read_cached_dataset("BTC/EUR", "1h", cache_root)
+    assert len(cached_after) == expected_rows
+    assert cached_after.index.min() == pd.to_datetime(start_ms, unit="ms", utc=True)
+    expected_last_ts = pd.to_datetime(
+        start_ms + frame_ms * (expected_rows - 1), unit="ms", utc=True
+    )
+    assert cached_after.index.max() == expected_last_ts
 
 
 def test_download_kraken_zip_requires_confirmation(monkeypatch, tmp_path: Path):

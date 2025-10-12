@@ -332,17 +332,47 @@ def _kraken_dataset_rows(
     timeframe: str,
     cache_root: Optional[Path] = None,
     confirm_download: Optional[ConfirmDownloadCallback] = None,
+    required_start_ms: Optional[int] = None,
+    required_end_ms: Optional[int] = None,
+    tolerance_ms: int = 0,
 ) -> pd.DataFrame:
     root = _kraken_cache_root(cache_root)
     cached = _read_cached_dataset(symbol, timeframe, root)
-    if not cached.empty and not _is_stale(_cache_dataset_path(symbol, timeframe, root), _KRAKEN_DATASET_MAX_AGE):
+
+    def _covers_required(frame: pd.DataFrame) -> bool:
+        if frame.empty:
+            return False
+
+        start_ok = True
+        end_ok = True
+        if required_start_ms is not None:
+            frame_start_ms = int(frame.index.min().timestamp() * 1000)
+            start_ok = frame_start_ms - tolerance_ms <= required_start_ms
+        if required_end_ms is not None:
+            frame_end_ms = int(frame.index.max().timestamp() * 1000)
+            end_ok = frame_end_ms + tolerance_ms >= required_end_ms
+        return start_ok and end_ok
+
+    cache_path = _cache_dataset_path(symbol, timeframe, root)
+    cache_fresh = not cached.empty and not _is_stale(cache_path, _KRAKEN_DATASET_MAX_AGE)
+    if cache_fresh and _covers_required(cached):
         return cached
 
-    zip_path = _download_kraken_zip(root, confirm_download=confirm_download)
-    if zip_path is not None:
-        fresh = _extract_kraken_dataset(zip_path, symbol, timeframe, root)
-        if not fresh.empty:
-            return fresh
+    needs_download = not cache_fresh or not _covers_required(cached)
+
+    zip_path: Optional[Path] = None
+    if needs_download:
+        zip_path = _download_kraken_zip(root, confirm_download=confirm_download)
+        if zip_path is not None:
+            fresh = _extract_kraken_dataset(zip_path, symbol, timeframe, root)
+            if not fresh.empty:
+                if _covers_required(fresh):
+                    return fresh
+                cached = fresh
+                cache_fresh = True
+
+    if cache_fresh and _covers_required(cached):
+        return cached
 
     if not cached.empty:
         return cached
@@ -421,11 +451,23 @@ def fetch_ohlcv(
     cache_root_path = _kraken_cache_root(cache_root)
     dataset_symbol = sym
     dataset_rows = _kraken_dataset_rows(
-        sym, timeframe, cache_root_path, confirm_download=confirm_download
+        sym,
+        timeframe,
+        cache_root_path,
+        confirm_download=confirm_download,
+        required_start_ms=since_ms,
+        required_end_ms=target_end_ms,
+        tolerance_ms=tolerance_ms,
     )
     if dataset_rows.empty and symbol != sym:
         alt_rows = _kraken_dataset_rows(
-            symbol, timeframe, cache_root_path, confirm_download=confirm_download
+            symbol,
+            timeframe,
+            cache_root_path,
+            confirm_download=confirm_download,
+            required_start_ms=since_ms,
+            required_end_ms=target_end_ms,
+            tolerance_ms=tolerance_ms,
         )
         if not alt_rows.empty:
             dataset_rows = alt_rows
