@@ -339,6 +339,149 @@ def fetch_ohlcv(
     pages_used = 0
     pages_hint = 0
 
+    def _kraken_trades_ohlcv_rows() -> tuple[list[list[float]], int]:
+        trade_pages = 0
+        cursor = since_ms
+        buckets: dict[int, dict[str, float]] = {}
+        last_seen: Optional[int] = None
+        trade_limit = max(limit_per_page * 4, 1000)
+        max_idle = 3
+        idle = 0
+
+        if not hasattr(ex, "fetch_trades"):
+            return [], trade_pages
+
+        def _parse_trade(trade: object) -> Optional[tuple[int, float, float]]:
+            timestamp: Optional[int] = None
+            price: Optional[float] = None
+            amount: Optional[float] = None
+
+            if isinstance(trade, dict):
+                raw_ts = trade.get("timestamp") or trade.get("time") or trade.get("datetime")
+                raw_price = trade.get("price") or trade.get("cost") or trade.get("rate")
+                raw_amount = trade.get("amount") or trade.get("volume") or trade.get("vol")
+            elif isinstance(trade, (list, tuple)):
+                raw_ts = trade[2] if len(trade) > 2 else None
+                raw_price = trade[0] if trade else None
+                raw_amount = trade[1] if len(trade) > 1 else None
+            else:
+                return None
+
+            if raw_ts is not None:
+                candidates: list[int] = []
+                if isinstance(raw_ts, (int, float)):
+                    try:
+                        value = float(raw_ts)
+                        scaled_values = [value, value * 1000]
+                        if value > 1_000_000_000_000:
+                            scaled_values.append(value / 1000)
+                        if value > 1_000_000_000_000_000:
+                            scaled_values.append(value / 1_000_000)
+
+                        for scaled in scaled_values:
+                            if scaled < 0:
+                                continue
+                            if math.isnan(scaled) or math.isinf(scaled):
+                                continue
+                            try:
+                                candidates.append(int(scaled))
+                            except Exception:
+                                continue
+                    except Exception:
+                        candidates = []
+                else:
+                    try:
+                        parsed_dt = int(pd.to_datetime(raw_ts, utc=True).timestamp() * 1000)
+                        candidates.append(parsed_dt)
+                    except Exception:
+                        candidates = []
+
+                if candidates:
+                    lower_bound = max(since_ms - tolerance_ms, 0)
+                    upper_bound = target_end_ms + tolerance_ms
+                    window_candidates = [ts for ts in candidates if lower_bound <= ts <= upper_bound]
+                    if window_candidates:
+                        anchor = max(cursor, lower_bound)
+                        timestamp = min(window_candidates, key=lambda ts: abs(ts - anchor))
+                    else:
+                        target_ts = target_end_ms if target_end_ms is not None else since_ms
+                        if target_ts is None:
+                            timestamp = min(candidates)
+                        else:
+                            timestamp = min(candidates, key=lambda ts: abs(ts - target_ts))
+
+            try:
+                price = float(raw_price) if raw_price is not None else None
+            except Exception:
+                price = None
+
+            try:
+                amount = float(raw_amount) if raw_amount is not None else None
+            except Exception:
+                amount = None
+
+            if timestamp is None or price is None or amount is None:
+                return None
+            return timestamp, price, amount
+
+        while trade_pages < page_budget and cursor <= target_end_ms + tolerance_ms:
+            try:
+                trades = ex.fetch_trades(sym, since=int(cursor), limit=trade_limit)
+            except rate_limit_exc:
+                time.sleep(1.25)
+                idle += 1
+                if idle >= max_idle:
+                    cursor += max(timeframe_ms, 1)
+                    idle = 0
+                continue
+            except Exception:
+                break
+
+            trade_pages += 1
+            idle = 0
+
+            parsed_trades: list[tuple[int, float, float]] = []
+            for trade in trades or []:
+                parsed = _parse_trade(trade)
+                if parsed is None:
+                    continue
+                ts, price, amount = parsed
+                if ts < since_ms or ts > target_end_ms + tolerance_ms:
+                    continue
+                parsed_trades.append((ts, price, amount))
+
+            if not parsed_trades:
+                break
+
+            for ts, price, amount in parsed_trades:
+                bucket = (ts // timeframe_ms) * timeframe_ms
+                bucket_data = buckets.setdefault(
+                    bucket, {"open": price, "high": price, "low": price, "close": price, "volume": 0.0}
+                )
+                bucket_data["high"] = max(bucket_data["high"], price)
+                bucket_data["low"] = min(bucket_data["low"], price)
+                bucket_data["close"] = price
+                bucket_data["volume"] += amount
+                if last_seen is None or ts > last_seen:
+                    last_seen = ts
+
+            if last_seen is None:
+                break
+
+            if last_seen + tolerance_ms >= target_end_ms:
+                break
+
+            cursor = last_seen + 1
+
+        rows = []
+        for bucket_ts, values in buckets.items():
+            rows.append(
+                [bucket_ts, values["open"], values["high"], values["low"], values["close"], values["volume"]]
+            )
+
+        rows.sort(key=lambda item: item[0])
+        return rows, trade_pages
+
     def _estimate_pages(row_count: int) -> int:
         if row_count <= 0:
             return 0
@@ -610,6 +753,13 @@ def fetch_ohlcv(
     if max_ts is not None and max_ts + tolerance_ms < target_end_ms and not _has_target_coverage():
         start_cursor = since_ms if max_ts is None else max(max_ts + timeframe_ms, since_ms)
         pages_used = _forward_paginate(start_cursor, pages_used)
+
+    if not _has_target_coverage():
+        trade_rows, trade_pages = _kraken_trades_ohlcv_rows()
+        if trade_rows:
+            _ingest_chunk(trade_rows)
+            pages_hint = max(pages_hint, _estimate_pages(len(trade_rows)))
+            pages_used = max(pages_used, trade_pages)
 
     if not _has_target_coverage():
         dataset_rows = _kraken_dataset_rows(sym, timeframe, since_ms, target_end_ms, tolerance_ms)

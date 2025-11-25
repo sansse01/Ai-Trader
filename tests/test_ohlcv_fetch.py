@@ -127,6 +127,41 @@ class AutoPagingKrakenExchange(FakeKrakenExchange):
         pytest.fail("publicGetOHLC should not be called when auto pagination succeeds")
 
 
+class TradesKrakenExchange(LateChunkKrakenExchange):
+    """Exchange that exposes deep history via trades instead of OHLCV."""
+
+    def __init__(self, start_ms: int, rows: int, frame_ms: int, trade_frame_ms: int) -> None:
+        super().__init__(start_ms=start_ms, rows=rows, frame_ms=frame_ms)
+        self.trade_frame_ms = trade_frame_ms
+        self.trade_calls: list[dict[str, object]] = []
+
+    def _build_trade(self, index: int) -> dict[str, object]:
+        ts = self.start_ms + index * self.trade_frame_ms
+        price = 1.0 + (index % 10) * 0.01
+        amount = 0.5 + (index % 5) * 0.1
+        return {"timestamp": ts, "price": price, "amount": amount}
+
+    def fetch_trades(self, symbol, since=None, limit=None, params=None):
+        limit = limit or 1000
+        self.trade_calls.append({
+            "since": since,
+            "limit": limit,
+            "params": params or {},
+        })
+        start_idx = 0
+        if since is not None:
+            start_idx = max(int((since - self.start_ms) // self.trade_frame_ms), 0)
+
+        trades: list[dict[str, object]] = []
+        for offset in range(limit):
+            idx = start_idx + offset
+            # Provide trades for 120 days worth of data.
+            if idx >= 120 * 24 * (self.frame_ms // self.trade_frame_ms):
+                break
+            trades.append(self._build_trade(idx))
+        return trades
+
+
 def test_fetch_ohlcv_falls_back_to_manual_pagination(monkeypatch):
     hours = 60 * 24
     frame_ms = 60 * 60 * 1000
@@ -263,3 +298,42 @@ def test_fetch_ohlcv_downloads_dataset_when_api_history_is_short(monkeypatch):
     assert result.reached_target is True
     assert result.coverage is not None
     assert result.coverage >= pd.Timedelta(days=120) - pd.Timedelta(milliseconds=frame_ms)
+
+
+def test_fetch_ohlcv_backfills_with_trades(monkeypatch):
+    frame_ms = 60 * 60 * 1000
+    # Exchange exposes only 30 days of OHLCV data but trades cover 120 days.
+    exchange_rows = 30 * 24
+    start_ms = 0
+    end_ms = start_ms + 120 * 24 * frame_ms
+
+    fake_exchange = TradesKrakenExchange(
+        start_ms=start_ms, rows=exchange_rows, frame_ms=frame_ms, trade_frame_ms=15 * 60 * 1000
+    )
+    fake_module = types.SimpleNamespace(
+        kraken=lambda: fake_exchange,
+        Exchange=_FakeExchangeNamespace(timeframe_seconds=frame_ms // 1000),
+        RateLimitExceeded=Exception,
+    )
+    monkeypatch.setattr(fetcher, "ccxt", fake_module)
+
+    dataset_calls: list[tuple] = []
+
+    def fake_dataset(symbol, timeframe, since_ms, target_end_ms, tolerance_ms):
+        dataset_calls.append((symbol, timeframe, since_ms, target_end_ms, tolerance_ms))
+        return []
+
+    monkeypatch.setattr(fetcher, "_kraken_dataset_rows", fake_dataset)
+
+    result = fetcher.fetch_ohlcv(
+        symbol="BTC/EUR",
+        timeframe="1h",
+        since_ms=start_ms,
+        target_end_ms=end_ms,
+        limit_per_page=720,
+    )
+
+    assert result.rows == 120 * 24
+    assert result.reached_target is True
+    assert fake_exchange.trade_calls, "trade-based backfill should be used"
+    assert dataset_calls == []
